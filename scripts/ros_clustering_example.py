@@ -17,6 +17,8 @@ from std_srvs.srv import Trigger, TriggerResponse
 from pose2d import Pose2D, apply_tf, apply_tf_to_pose, inverse_pose2d
 import lidar_clustering
 
+N_PAST_POS = 100
+
 class Clustering(object):
     def __init__(self, args):
         self.args = args
@@ -42,12 +44,54 @@ class Clustering(object):
         self.tf_br = tf.TransformBroadcaster()
         # Timers
         rospy.Timer(rospy.Duration(0.001), self.tf_callback)
+        # data
+        self.clusters_data = ([], [], [], [], [], [])
+        self.tf_pastrobs_in_fix = []
         # visuals 
         self.fig = plt.figure("clusters")
         try:
-            plt.show()
+            # ------ VISUALS LOOP -----------------------------------------------------
+#             plt.show()
 #             rospy.spin()
+            while True:
+                xx, yy, clusters, is_legs, cogs, radii = self.clusters_data
+                # past positions
+                tf_past_in_rob = []
+                if self.tf_pastrobs_in_fix:
+                    tf_rob_in_fix = self.tf_pastrobs_in_fix[-1]
+                    for i, tf_a in enumerate(self.tf_pastrobs_in_fix[::-1]):
+                        if i > N_PAST_POS:
+                            break
+                        tf_b = apply_tf_to_pose(Pose2D(tf_a), inverse_pose2d(Pose2D(tf_rob_in_fix)))
+                        tf_past_in_rob.append(tf_b)
+                # Plotting
+                plt.figure("clusters")
+                plt.cla()
+                plt.scatter(xx, yy, zorder=1, facecolor=(1,1,1,1), edgecolor=(0,0,0,1), color='k', marker='.')
+        #         for x, y in zip(xx, yy):
+        #             plt.plot([0, x], [0, y], linewidth=0.01, color='red' , zorder=2)
+                plt.scatter([0],[0],marker='+', color='k',s=1000)
+                for c in clusters:
+                    plt.plot(xx[c], yy[c], zorder=2)
+                for l, cog, r in zip(is_legs,cogs, radii):
+                    if l:
+                        patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linewidth=3)
+                    else:
+                        patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linestyle='--')
+                    plt.gca().add_artist(patch)
+                if tf_past_in_rob:
+                    xy_past = np.array(tf_past_in_rob)
+                    plt.plot(xy_past[:,0], xy_past[:,1], color='red')
+
+                plt.gca().set_aspect('equal',adjustable='box')
+                LIM = 10
+                plt.ylim([-LIM, LIM])
+                plt.xlim([-LIM, LIM])
+                # pause
+                plt.pause(0.1)
+                rospy.timer.sleep(0.01)
         except KeyboardInterrupt:
+            print("Keyboard interrupt: shutting down.")
             rospy.signal_shutdown('KeyboardInterrupt')
 
 
@@ -73,6 +117,10 @@ class Clustering(object):
             print("tf_rob_in_fix not found yet")
             return
         # TODO check that odom and tf are not old
+
+        self.tf_pastrobs_in_fix.append(self.tf_rob_in_fix)
+        if len(self.tf_pastrobs_in_fix) > N_PAST_POS:
+            self.tf_pastrobs_in_fix = self.tf_pastrobs_in_fix[-N_PAST_POS:]
 
         scan = np.array(msg.ranges, dtype=np.float32)
 
@@ -103,30 +151,7 @@ class Clustering(object):
         # legs
         is_legs = [True if 0.03 < r and r < 0.15 and len(c) >= MIN_CLUSTER_SIZE else False for r, c in zip(radii, clusters)]
 
-        # VISUALS -------------------------------------------
-
-        plt.figure("clusters")
-        plt.cla()
-        plt.scatter(xx, yy, zorder=1, facecolor=(1,1,1,1), edgecolor=(0,0,0,1), color='k', marker='.')
-#         for x, y in zip(xx, yy):
-#             plt.plot([0, x], [0, y], linewidth=0.01, color='red' , zorder=2)
-
-        plt.scatter([0],[0],marker='+', color='k',s=1000)
-
-        for c in clusters:
-            plt.plot(xx[c], yy[c], zorder=2)
-
-        for l, cog, r in zip(is_legs,cogs, radii):
-            if l:
-                patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linewidth=3)
-            else:
-                patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linestyle='--')
-            plt.gca().add_artist(patch)
-
-        plt.gca().set_aspect('equal',adjustable='box')
-        plt.ylim([-3, 3])
-        plt.xlim([-3, 3])
-        plt.pause(0.1)
+        self.clusters_data = (xx, yy, clusters, is_legs, cogs, radii)
 
 
         if False:
