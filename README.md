@@ -1,7 +1,7 @@
 # pylidar2d
 Python tools for 2d lidar
 
-[img](github.com/danieldugas/pylidar2d/raw/master/pylidar2d.png)
+![img](https://raw.githubusercontent.com/danieldugas/pylidar2d/master/pylidar2d.png)
 
 ## Install
 
