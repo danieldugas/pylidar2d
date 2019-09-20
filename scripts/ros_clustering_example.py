@@ -77,7 +77,8 @@ class Clustering(object):
         scan = np.array(msg.ranges, dtype=np.float32)
 
         # clustering
-        EUCLIDEAN_CLUSTERING_THRESH_M = 0.2
+        EUCLIDEAN_CLUSTERING_THRESH_M = 0.05
+        MIN_CLUSTER_SIZE = 3
         angles = np.linspace(0, 2*np.pi, scan.shape[0]+1, dtype=np.float32)[:-1]
         xx = np.cos(angles) * scan
         yy = np.sin(angles) * scan
@@ -88,12 +89,19 @@ class Clustering(object):
         toc = timer()
         print("Clustering : {} ms".format((toc-tic)*1000.))
 
+        # filter small clusters
+#         clusters = [c for c, l in zip(clusters, cluster_sizes) if l >= MIN_CLUSTER_SIZE]
+
+
         # center of gravity
         tic = timer()
         cogs = [[np.mean(xx[c]), np.mean(yy[c])] for c in clusters]
         radii = [np.max(np.sqrt((xx[c]-cog[0])**2 + (yy[c]-cog[1])**2)) for cog, c in zip(cogs, clusters)]
         toc = timer()
         print("C.O.Gs, Radii : {} ms".format((toc-tic)*1000.))
+
+        # legs
+        is_legs = [True if 0.03 < r and r < 0.15 and len(c) >= MIN_CLUSTER_SIZE else False for r, c in zip(radii, clusters)]
 
         # VISUALS -------------------------------------------
 
@@ -103,16 +111,21 @@ class Clustering(object):
 #         for x, y in zip(xx, yy):
 #             plt.plot([0, x], [0, y], linewidth=0.01, color='red' , zorder=2)
 
+        plt.scatter([0],[0],marker='+', color='k',s=1000)
+
         for c in clusters:
             plt.plot(xx[c], yy[c], zorder=2)
 
-        for cog, r in zip(cogs, radii):
-            patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linestyle='--')
+        for l, cog, r in zip(is_legs,cogs, radii):
+            if l:
+                patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linewidth=3)
+            else:
+                patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linestyle='--')
             plt.gca().add_artist(patch)
 
-        plt.axis('equal')
-        plt.xlim([-5, 5])
-        plt.ylim([-5, 5])
+        plt.gca().set_aspect('equal',adjustable='box')
+        plt.ylim([-3, 3])
+        plt.xlim([-3, 3])
         plt.pause(0.1)
 
 
