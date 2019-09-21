@@ -23,11 +23,11 @@ class Clustering(object):
     def __init__(self, args):
         self.args = args
         # consts
-        self.kLidarTopic = "/combined_scan"
+        self.kLidarTopic = args.scan_topic
         self.kFixedFrameTopic = "/pepper_robot/odom"
         self.kCmdVelTopic = "/cmd_vel"
         self.kGlobalPathTopic = "/planner/GlobalPath"
-        self.kFixedFrame = "odom" # ideally something truly fixed, like /map
+        self.kFixedFrame = args.fixed_frame # ideally something truly fixed, like /map
         self.kRobotFrame = "base_footprint"
         self.kMaxObstacleVel_ms = 10. # [m/s]
         # vars
@@ -50,46 +50,7 @@ class Clustering(object):
         # visuals 
         self.fig = plt.figure("clusters")
         try:
-            # ------ VISUALS LOOP -----------------------------------------------------
-#             plt.show()
-#             rospy.spin()
-            while True:
-                xx, yy, clusters, is_legs, cogs, radii = self.clusters_data
-                # past positions
-                tf_past_in_rob = []
-                if self.tf_pastrobs_in_fix:
-                    tf_rob_in_fix = self.tf_pastrobs_in_fix[-1]
-                    for i, tf_a in enumerate(self.tf_pastrobs_in_fix[::-1]):
-                        if i > N_PAST_POS:
-                            break
-                        tf_b = apply_tf_to_pose(Pose2D(tf_a), inverse_pose2d(Pose2D(tf_rob_in_fix)))
-                        tf_past_in_rob.append(tf_b)
-                # Plotting
-                plt.figure("clusters")
-                plt.cla()
-                plt.scatter(xx, yy, zorder=1, facecolor=(1,1,1,1), edgecolor=(0,0,0,1), color='k', marker='.')
-        #         for x, y in zip(xx, yy):
-        #             plt.plot([0, x], [0, y], linewidth=0.01, color='red' , zorder=2)
-                plt.scatter([0],[0],marker='+', color='k',s=1000)
-                for c in clusters:
-                    plt.plot(xx[c], yy[c], zorder=2)
-                for l, cog, r in zip(is_legs,cogs, radii):
-                    if l:
-                        patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linewidth=3)
-                    else:
-                        patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linestyle='--')
-                    plt.gca().add_artist(patch)
-                if tf_past_in_rob:
-                    xy_past = np.array(tf_past_in_rob)
-                    plt.plot(xy_past[:,0], xy_past[:,1], color='red')
-
-                plt.gca().set_aspect('equal',adjustable='box')
-                LIM = 10
-                plt.ylim([-LIM, LIM])
-                plt.xlim([-LIM, LIM])
-                # pause
-                plt.pause(0.1)
-                rospy.timer.sleep(0.01)
+            self.visuals_loop()
         except KeyboardInterrupt:
             print("Keyboard interrupt: shutting down.")
             rospy.signal_shutdown('KeyboardInterrupt')
@@ -119,8 +80,8 @@ class Clustering(object):
         # TODO check that odom and tf are not old
 
         self.tf_pastrobs_in_fix.append(self.tf_rob_in_fix)
-        if len(self.tf_pastrobs_in_fix) > N_PAST_POS:
-            self.tf_pastrobs_in_fix = self.tf_pastrobs_in_fix[-N_PAST_POS:]
+        if len(self.tf_pastrobs_in_fix) > 2*N_PAST_POS:
+            self.tf_pastrobs_in_fix = self.tf_pastrobs_in_fix[::2]
 
         scan = np.array(msg.ranges, dtype=np.float32)
 
@@ -135,7 +96,7 @@ class Clustering(object):
                                                          EUCLIDEAN_CLUSTERING_THRESH_M)
         cluster_sizes = lidar_clustering.cluster_sizes(len(scan), clusters)
         toc = timer()
-        print("Clustering : {} ms".format((toc-tic)*1000.))
+        clustering_time = toc-tic
 
         # filter small clusters
 #         clusters = [c for c, l in zip(clusters, cluster_sizes) if l >= MIN_CLUSTER_SIZE]
@@ -146,7 +107,7 @@ class Clustering(object):
         cogs = [[np.mean(xx[c]), np.mean(yy[c])] for c in clusters]
         radii = [np.max(np.sqrt((xx[c]-cog[0])**2 + (yy[c]-cog[1])**2)) for cog, c in zip(cogs, clusters)]
         toc = timer()
-        print("C.O.Gs, Radii : {} ms".format((toc-tic)*1000.))
+        cog_radii_time = toc-tic
 
         # legs
         is_legs = [True if 0.03 < r and r < 0.15 and len(c) >= MIN_CLUSTER_SIZE else False for r, c in zip(radii, clusters)]
@@ -243,7 +204,45 @@ class Clustering(object):
 
         atoc = timer()
         if self.args.hz:
-            print("DWA callback: {:.2f} Hz".format(1/(atoc-atic)))
+            print("DWA callback: {:.2f} Hz | C.O.Gs, Radii: {} ms, Clustering: {} ms".format(
+                1/(atoc-atic), cog_radii_time*1000., clustering_time*1000.))
+
+    def visuals_loop(self):
+        while True:
+            xx, yy, clusters, is_legs, cogs, radii = self.clusters_data
+            # past positions
+            tf_past_in_rob = []
+            if self.tf_pastrobs_in_fix:
+                tf_rob_in_fix = self.tf_pastrobs_in_fix[-1]
+                for i, tf_a in enumerate(self.tf_pastrobs_in_fix[::-1]):
+                    tf_b = apply_tf_to_pose(Pose2D(tf_a), inverse_pose2d(Pose2D(tf_rob_in_fix)))
+                    tf_past_in_rob.append(tf_b)
+            # Plotting
+            plt.figure("clusters")
+            plt.cla()
+            plt.scatter(xx, yy, zorder=1, facecolor=(1,1,1,1), edgecolor=(0,0,0,1), color='k', marker='.')
+    #         for x, y in zip(xx, yy):
+    #             plt.plot([0, x], [0, y], linewidth=0.01, color='red' , zorder=2)
+            plt.scatter([0],[0],marker='+', color='k',s=1000)
+            for c in clusters:
+                plt.plot(xx[c], yy[c], zorder=2)
+            for l, cog, r in zip(is_legs,cogs, radii):
+                if l:
+                    patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linewidth=3)
+                else:
+                    patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linestyle='--')
+                plt.gca().add_artist(patch)
+            if tf_past_in_rob:
+                xy_past = np.array(tf_past_in_rob)
+                plt.plot(xy_past[:,0], xy_past[:,1], color='red')
+
+            plt.gca().set_aspect('equal',adjustable='box')
+            LIM = 10
+            plt.ylim([-LIM, LIM])
+            plt.xlim([-LIM, LIM])
+            # pause
+            plt.pause(0.1)
+            rospy.timer.sleep(0.01)
 
 
 def parse_args():
@@ -254,6 +253,8 @@ def parse_args():
             action='store_true',
             help='if set, prints planner frequency to script output',
             )
+    parser.add_argument('--fixed-frame', default="odom")
+    parser.add_argument('--scan-topic', default="/combined_scan")
     ARGS, unknown_args = parser.parse_known_args()
 
     # deal with unknown arguments
