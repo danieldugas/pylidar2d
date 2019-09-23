@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 from copy import deepcopy
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -6,115 +7,21 @@ import rospy
 import tf
 import threading
 from sensor_msgs.msg import LaserScan
+import signal
+import sys
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import Twist, Quaternion
 from timeit import default_timer as timer
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, Twist
 from std_srvs.srv import Trigger, TriggerResponse
 
 # local packages
 from pose2d import Pose2D, apply_tf, apply_tf_to_pose, inverse_pose2d
 import lidar_clustering
+from lib_tracking.lidar_tracking import Tracker
 
 N_PAST_POS = 100
-
-class IdCounter(object):
-    def __init__(self):
-        self.id_count = 0
-    def next_id(self):
-        id_ = self.id_count
-        self.id_count += 1
-        return id_
-
-class Track(object):
-    def __init__(self, id_):
-        self.id = id_
-        self.n_hits = 0
-        self.sum_radius = 0
-        self.pos_history = []
-        self.time_history = []
-
-    def add_detection(self, pos, radius, time):
-        self.n_hits += 1
-        self.sum_radius += radius
-        self.pos_history.append(pos)
-        self.time_history.append(time)
-
-    def predict_next_pos(self):
-        raise NotImplementedError
-
-    def area_of_likely_appearance(self, time):
-        def match_error(pos, radius):
-            dist_from_last_pos = np.linalg.norm(np.array(pos) - np.array(self.pos_history[-1]))
-            if dist_from_last_pos > 0.5:
-                return np.inf
-            return dist_from_last_pos
-        return match_error
-
-class Tracker(object):
-    def __init__(self, args):
-        self.args = args
-        self.active_tracks = {}
-        self.id_counter = IdCounter()
-        # metadata for convenience
-        self.latest_matches = []
-        self.new_tracks = []
-
-    def match(self, cogs, radii, time):
-        """ 
-        inputs: 
-          cogs : C.O.G.s in fixed frame
-          radii : radii of detections
-          time : rospy.Time of scan from which detections were taken
-        """
-        unmatched_detections_idcs = set(range(len(cogs)))
-        self.latest_matches = []
-        self.new_tracks = []
-        # look for latest match for each active track
-        for trackid in self.active_tracks:
-            track = self.active_tracks[trackid]
-            bestmatchidx = None
-            bestmatcherror = np.inf
-            for i in unmatched_detections_idcs:
-                cog, r = cogs[i], radii[i]
-                matcherror = track.area_of_likely_appearance(time)(cog, r)
-                if matcherror < bestmatcherror:
-                    bestmatchidx = i
-                    bestmatcherror = matcherror
-            if bestmatchidx is not None:
-                unmatched_detections_idcs.remove(bestmatchidx)
-                cog, r = cogs[bestmatchidx], radii[bestmatchidx]
-                track.add_detection(cog, r, time)
-                self.latest_matches.append(trackid)
-        # create new tracks for unmatched detections
-        for i in unmatched_detections_idcs:
-            newtrack = Track(self.id_counter.next_id())
-            newtrack.add_detection(cogs[i], radii[i], time)
-            self.active_tracks[newtrack.id] = newtrack
-            self.new_tracks.append(newtrack.id)
-        # drop old tracks
-        to_delete = []
-        for trackid in self.active_tracks:
-            track = self.active_tracks[trackid]
-            if (time - track.time_history[-1]) > rospy.Duration(10.):
-                to_delete.append(trackid)
-        for trackid in to_delete:
-            del self.active_tracks[trackid]
-
-    def vizualize_tracks(self):
-        for trackid in self.active_tracks:
-            track = self.active_tracks[trackid]
-            xy = np.array(track.pos_history)
-            if trackid in self.latest_matches:
-                color = "green"
-            elif trackid in self.new_tracks:
-                color = "blue"
-            else:
-                color = "grey"
-            plt.plot(xy[:,0], xy[:,1], color=color)
-            patch = patches.Circle((xy[-1,0], xy[-1,1]), 1.*track.sum_radius/track.n_hits, facecolor=(1,1,1,0), edgecolor=color)
-            plt.gca().add_artist(patch)
 
 
 
@@ -146,14 +53,14 @@ class Clustering(object):
         # Timers
         rospy.Timer(rospy.Duration(0.001), self.tf_callback)
         # data
-        self.clusters_data = None
+        self.transport_data = None
         self.tf_pastrobs_in_fix = []
         # visuals 
         self.fig = plt.figure("clusters")
         try:
             self.visuals_loop()
         except KeyboardInterrupt:
-            print("Keyboard interrupt: shutting down.")
+            print("Keyboard interrupt - shutting down.")
             rospy.signal_shutdown('KeyboardInterrupt')
 
 
@@ -213,7 +120,7 @@ class Clustering(object):
             # legs
             is_legs = [True if 0.03 < r and r < 0.15 and len(c) >= MIN_CLUSTER_SIZE else False for r, c in zip(radii, clusters)]
 
-            self.clusters_data = (xx, yy, clusters, is_legs, cogs, radii, self.tf_rob_in_fix)
+            self.transport_data = (xx, yy, clusters, is_legs, cogs, radii, self.tf_rob_in_fix)
 
             leg_cogs_in_fix = []
             leg_radii = []
@@ -221,108 +128,29 @@ class Clustering(object):
                 if is_legs[i]:
                     leg_cogs_in_fix.append(apply_tf(cogs[i], Pose2D(self.tf_rob_in_fix)))
                     leg_radii.append(radii[i])
+
+            # Tracks
             self.tracker.match(leg_cogs_in_fix, leg_radii, msg.header.stamp)
 
-            if False:
-                # publish cmd_vel vis
-                pub = rospy.Publisher("/dwa_cmd_vel", Marker, queue_size=1)
-                mk = Marker()
-                mk.header.frame_id = self.kRobotFrame
-                mk.ns = "arrows"
-                mk.id = 0
-                mk.type = 0
-                mk.action = 0
-                mk.scale.x = 0.02
-                mk.scale.y = 0.02
-                mk.color.b = 1
-                mk.color.a = 1
-                mk.frame_locked = True
-                pt = Point()
-                pt.x = 0
-                pt.y = 0
-                pt.z = 0.03
-                mk.points.append(pt)
-                pt = Point()
-                pt.x = 0 + best_u * DWA_DT
-                pt.y = 0 + best_v * DWA_DT
-                pt.z = 0.03
-                mk.points.append(pt)
-                pub.publish(mk)
-                pub = rospy.Publisher("/dwa_goal", Marker, queue_size=1)
-                mk = Marker()
-                mk.header.frame_id = self.kRobotFrame
-                mk.ns = "arrows"
-                mk.id = 0
-                mk.type = 0
-                mk.action = 0
-                mk.scale.x = 0.02
-                mk.scale.y = 0.02
-                mk.color.g = 1
-                mk.color.a = 1
-                mk.frame_locked = True
-                pt = Point()
-                pt.x = 0
-                pt.y = 0
-                pt.z = 0.03
-                mk.points.append(pt)
-                pt = Point()
-                pt.x = 0 + gx
-                pt.y = 0 + gy
-                pt.z = 0.03
-                mk.points.append(pt)
-                pub.publish(mk)
-                pub = rospy.Publisher("/dwa_radius", Marker, queue_size=1)
-                mk = Marker()
-                mk.header.frame_id = self.kRobotFrame
-                mk.ns = "radius"
-                mk.id = 0
-                mk.type = 3
-                mk.action = 0
-                mk.pose.position.z = -0.1
-                mk.scale.x = COMFORT_RADIUS_M * 2
-                mk.scale.y = COMFORT_RADIUS_M * 2
-                mk.scale.z = 0.01
-                mk.color.b = 1
-                mk.color.g = 1
-                mk.color.r = 1
-                mk.color.a = 1
-                mk.frame_locked = True
-                pub.publish(mk)
-
-                # publish scan prediction
-                msg_next = deepcopy(msg)
-                msg_next.ranges = s_next
-                # for pretty colors
-                cluster_ids = clustering.cluster_ids(len(x), clusters)
-                random_map = np.arange(len(cluster_ids))
-                np.random.shuffle(random_map)
-                cluster_ids = random_map[cluster_ids]
-                msg_next.intensities = cluster_ids
-                self.pubs[0].publish(msg_next)
-
-                # publish past
-                msg_prev = deepcopy(msg)
-                msg_prev.ranges = self.msg_prev.ranges
-                self.pubs[1].publish(msg_prev)
-
-                # ...
+            # publish markers
+            self.publish_markers()
 
             # finally, set up for next callback
             self.msg_prev = msg
 
         atoc = timer()
         if self.args.hz:
-            print("DWA callback: {:.2f} Hz | C.O.Gs, Radii: {} ms, Clustering: {} ms".format(
+            print("DWA callback: {:.2f} Hz | C.O.Gs, Radii: {:.1f} ms, Clustering: {:.1f} ms".format(
                 1/(atoc-atic), cog_radii_time*1000., clustering_time*1000.))
 
     def visuals_loop(self):
         while True:
             with self.lock:
-                if self.clusters_data is None:
+                if self.transport_data is None:
                     plt.pause(0.1)
                     rospy.timer.sleep(0.01)
                     continue
-                xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.clusters_data
+                xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
                 # transform data to fixed frame
                 pose2d_rob_in_fix = Pose2D(tf_rob_in_fix)
                 xy_f = apply_tf(np.vstack([xx, yy]).T, pose2d_rob_in_fix)
@@ -346,10 +174,12 @@ class Clustering(object):
 #                 plt.plot(xx[c], yy[c], zorder=2)
             for l, cog, r in zip(is_legs,cogs_f, radii):
                 if l:
-                    patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linewidth=3)
+#                     patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linewidth=3)
+#                     plt.gca().add_artist(patch)
+                    plt.scatter([cog[0]], [cog[1]], marker='+', color='green', s=500)
                 else:
                     patch = patches.Circle(cog, r, facecolor=(0,0,0,0), edgecolor=(0,0,0,1), linestyle='--')
-                plt.gca().add_artist(patch)
+                    plt.gca().add_artist(patch)
             if pose2d_past_in_fix:
                 xy_past = np.array(pose2d_past_in_fix)
                 plt.plot(xy_past[:,0], xy_past[:,1], color='red')
@@ -364,6 +194,120 @@ class Clustering(object):
             # pause
             plt.pause(0.1)
             rospy.timer.sleep(0.01)
+
+    def publish_markers(self):
+        if self.transport_data is None:
+            return
+        xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
+        # transform data to fixed frame
+        pose2d_rob_in_fix = Pose2D(tf_rob_in_fix)
+        xy_f = apply_tf(np.vstack([xx, yy]).T, pose2d_rob_in_fix)
+        cogs_f = apply_tf(np.array(cogs), pose2d_rob_in_fix)
+        # past positions
+        pose2d_past_in_fix = []
+        if self.tf_pastrobs_in_fix:
+            for tf_a in self.tf_pastrobs_in_fix[::-1]:
+                pose2d_past_in_fix.append(Pose2D(tf_a))
+        # tracks
+        tracks_xy, tracks_color, tracks_in_frame = [], [], []
+        for trackid in self.tracker.active_tracks:
+            track = self.tracker.active_tracks[trackid]
+            xy = np.array(track.pos_history)
+            is_track_in_frame = True
+            if trackid in self.tracker.latest_matches:
+                color = (0.,1.,0.,1.) # green
+            elif trackid in self.tracker.new_tracks:
+                color = (0.,0.,1.,1.) # blue
+            else:
+                color = (0.7, 0.7, 0.7, 1.)
+                is_track_in_frame = False
+            tracks_xy.append(xy)
+            tracks_color.append(color)
+            tracks_in_frame.append(is_track_in_frame)
+
+        pub = rospy.Publisher("/detections", Marker, queue_size=1)
+        # ...
+
+        pub = rospy.Publisher("/tracks", MarkerArray, queue_size=1)
+        # delete all markers
+        ma = MarkerArray()
+        mk = Marker()
+        mk.header.frame_id = self.kFixedFrame
+        mk.ns = "tracks"
+        mk.id = 0
+        mk.type = 4 # LINE_STRIP
+        mk.action = 3 # deleteall
+        ma.markers.append(mk)
+        pub.publish(ma)
+        # publish tracks
+        ma = MarkerArray()
+        id_ = 0
+        # track lines
+        for color, xy in zip(tracks_color, tracks_xy):
+            mk = Marker()
+            mk.header.frame_id = self.kFixedFrame
+            mk.ns = "tracks"
+            mk.id = id_
+            id_+=1
+            mk.type = 4 # LINE_STRIP
+            mk.action = 0
+            mk.scale.x = 0.02
+            mk.color.r = color[0]
+            mk.color.g = color[1]
+            mk.color.b = color[2]
+            mk.color.a = color[3]
+            mk.frame_locked = True
+            for x, y in xy:
+                pt = Point()
+                pt.x = x
+                pt.y = y
+                pt.z = 0.03
+                mk.points.append(pt)
+            ma.markers.append(mk)
+        # track endpoint
+        for color, xy in zip(tracks_color, tracks_xy):
+            mk = Marker()
+            mk.header.frame_id = self.kFixedFrame
+            mk.ns = "tracks"
+            mk.id = id_
+            id_+=1
+            mk.type = 3 # CYLINDER
+            mk.action = 0
+            mk.scale.x = 0.1
+            mk.scale.y = 0.1
+            mk.scale.z = 0.1
+            mk.color.r = color[0]
+            mk.color.g = color[1]
+            mk.color.b = color[2]
+            mk.color.a = color[3]
+            mk.frame_locked = True
+            mk.pose.position.x = x
+            mk.pose.position.y = y
+            mk.pose.position.z = 0.03
+            ma.markers.append(mk)
+        pub.publish(ma)
+
+        pub = rospy.Publisher("/robot_track", Marker, queue_size=1)
+        mk = Marker()
+        mk.header.frame_id = self.kFixedFrame
+        mk.ns = "robot_track"
+        mk.id = 0
+        mk.type = 4 # LINE_STRIP
+        mk.action = 0
+        mk.scale.x = 0.02
+        mk.color.r = 1
+        mk.color.g = 0
+        mk.color.b = 0
+        mk.color.a = 1
+        mk.frame_locked = True
+        for x, y, _ in pose2d_past_in_fix:
+            pt = Point()
+            pt.x = x
+            pt.y = y
+            pt.z = 0.03
+            mk.points.append(pt)
+        ma.markers.append(mk)
+        pub.publish(mk)
 
 
 def parse_args():
@@ -381,12 +325,18 @@ def parse_args():
     # deal with unknown arguments
     # ROS appends some weird args, ignore those, but not the rest
     if unknown_args:
-        rosparser = argparse.ArgumentParser()
-        rosparser.add_argument(
-                '__log:')
-        rosparser.add_argument(
-                '__name:')
-        rosargs = rosparser.parse_args(unknown_args)
+        try:
+            rosparser = argparse.ArgumentParser()
+            rosparser.add_argument(
+                    '__log:')
+            rosparser.add_argument(
+                    '__name:')
+            rosargs = rosparser.parse_args(unknown_args)
+        except rospy.exceptions.ROSInterruptException as e:
+            print("unknown arguments:")
+            print(unknown_args)
+            parser.parse_args(args=["--help"])
+            raise e
     return ARGS
 
 if __name__=="__main__":

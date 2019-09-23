@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="rosbag" default="hg2" />
+  <include file="$(find asl_pepper_rosbags)/launch/$(arg rosbag).launch">
+  </include>
+
+  <include file="$(find asl_pepper_gmapping)/launch/gmapping.launch">
+    <arg name="output" value="log"/>
+  </include>
+
+  <node pkg="ros_run_command" type="ros_run_command" name="python_tracker" output="screen"
+    args="python /home/daniel/Documents/pylidar2d/scripts/ros_tracker_example.py --hz --fixed-frame gmap"
+  />
+
+</launch>
+
+
