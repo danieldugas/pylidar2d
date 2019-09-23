@@ -239,6 +239,15 @@ class Clustering(object):
         mk.action = 3 # deleteall
         ma.markers.append(mk)
         pub.publish(ma)
+        ma = MarkerArray()
+        mk = Marker()
+        mk.header.frame_id = self.kFixedFrame
+        mk.ns = "tracks"
+        mk.id = 0
+        mk.type = 3 # CYLINDER
+        mk.action = 3 # deleteall
+        ma.markers.append(mk)
+        pub.publish(ma)
         # publish tracks
         ma = MarkerArray()
         id_ = 0
@@ -266,6 +275,7 @@ class Clustering(object):
             ma.markers.append(mk)
         # track endpoint
         for color, xy in zip(tracks_color, tracks_xy):
+            x, y = xy[-1]
             mk = Marker()
             mk.header.frame_id = self.kFixedFrame
             mk.ns = "tracks"
