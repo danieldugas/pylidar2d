@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="rosbag" default="hg2" />
+  <arg name="mapname" default="hg_main_hall" />
+
+  <!-- Rosbag -->
+  <include file="$(find asl_pepper_rosbags)/launch/$(arg rosbag).launch">
+  </include>
+
+  <!-- Gmapping & Map Matching -->
+  <include file="$(find asl_pepper_gmapping)/launch/gmapping.launch">
+    <arg name="output" value="log"/>
+  </include>
+  <include file="$(find map_matcher)/launch/map_matcher.launch">
+    <arg name="slam_map_topic" value="/gmap"/>
+    <arg name="reference_map_name" value="$(arg mapname)"/>
+    <arg name="maps_folder" value="$(env HOME)/maps"/>
+  </include>
+
+  <!-- Tracker -->
+  <node pkg="ros_run_command" type="ros_run_command" name="python_tracker" output="screen"
+    args="python $(find pylidar2d_ros)/scripts/ros_tracker_example.py --hz --fixed-frame gmap"
+  />
+
+</launch>
+
+

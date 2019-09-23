@@ -325,18 +325,12 @@ def parse_args():
     # deal with unknown arguments
     # ROS appends some weird args, ignore those, but not the rest
     if unknown_args:
-        try:
-            rosparser = argparse.ArgumentParser()
-            rosparser.add_argument(
-                    '__log:')
-            rosparser.add_argument(
-                    '__name:')
-            rosargs = rosparser.parse_args(unknown_args)
-        except rospy.exceptions.ROSInterruptException as e:
+        non_ros_unknown_args = rospy.myargv(unknown_args)
+        if non_ros_unknown_args:
             print("unknown arguments:")
-            print(unknown_args)
+            print(non_ros_unknown_args)
             parser.parse_args(args=["--help"])
-            raise e
+            raise ValueError
     return ARGS
 
 if __name__=="__main__":
