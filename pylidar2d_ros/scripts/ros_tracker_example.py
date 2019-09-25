@@ -9,11 +9,12 @@ import threading
 from sensor_msgs.msg import LaserScan
 import signal
 import sys
+from costmap_converter.msg import ObstacleArrayMsg, ObstacleMsg
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import Twist, Quaternion
 from timeit import default_timer as timer
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point, Twist
+from geometry_msgs.msg import Point, Point32, Twist
 from std_srvs.srv import Trigger, TriggerResponse
 
 # local packages
@@ -37,7 +38,6 @@ class Clustering(object):
         self.kRobotFrame = "base_footprint"
         self.kMaxObstacleVel_ms = 10. # [m/s]
         # vars
-        self.msg_prev = None
         self.odom = None
         self.tf_rob_in_fix = None
         self.tracker = Tracker(args)
@@ -77,9 +77,6 @@ class Clustering(object):
         atic = timer()
         with self.lock:
             # edge case: first callback
-            if self.msg_prev is None:
-                self.msg_prev = msg
-                return
             if self.odom is None:
                 print("odom not received yet")
                 return
@@ -132,11 +129,9 @@ class Clustering(object):
             # Tracks
             self.tracker.match(leg_cogs_in_fix, leg_radii, msg.header.stamp)
 
-            # publish markers
-            self.publish_markers()
-
-            # finally, set up for next callback
-            self.msg_prev = msg
+        # publish markers
+        self.publish_markers()
+        self.publish_obstacles()
 
         atoc = timer()
         if self.args.hz:
@@ -196,34 +191,35 @@ class Clustering(object):
             rospy.timer.sleep(0.01)
 
     def publish_markers(self):
-        if self.transport_data is None:
-            return
-        xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
-        # transform data to fixed frame
-        pose2d_rob_in_fix = Pose2D(tf_rob_in_fix)
-        xy_f = apply_tf(np.vstack([xx, yy]).T, pose2d_rob_in_fix)
-        cogs_f = apply_tf(np.array(cogs), pose2d_rob_in_fix)
-        # past positions
-        pose2d_past_in_fix = []
-        if self.tf_pastrobs_in_fix:
-            for tf_a in self.tf_pastrobs_in_fix[::-1]:
-                pose2d_past_in_fix.append(Pose2D(tf_a))
-        # tracks
-        tracks_xy, tracks_color, tracks_in_frame = [], [], []
-        for trackid in self.tracker.active_tracks:
-            track = self.tracker.active_tracks[trackid]
-            xy = np.array(track.pos_history)
-            is_track_in_frame = True
-            if trackid in self.tracker.latest_matches:
-                color = (0.,1.,0.,1.) # green
-            elif trackid in self.tracker.new_tracks:
-                color = (0.,0.,1.,1.) # blue
-            else:
-                color = (0.7, 0.7, 0.7, 1.)
-                is_track_in_frame = False
-            tracks_xy.append(xy)
-            tracks_color.append(color)
-            tracks_in_frame.append(is_track_in_frame)
+        with self.lock:
+            if self.transport_data is None:
+                return
+            xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
+            # transform data to fixed frame
+            pose2d_rob_in_fix = Pose2D(tf_rob_in_fix)
+            xy_f = apply_tf(np.vstack([xx, yy]).T, pose2d_rob_in_fix)
+            cogs_f = apply_tf(np.array(cogs), pose2d_rob_in_fix)
+            # past positions
+            pose2d_past_in_fix = []
+            if self.tf_pastrobs_in_fix:
+                for tf_a in self.tf_pastrobs_in_fix[::-1]:
+                    pose2d_past_in_fix.append(Pose2D(tf_a))
+            # tracks
+            tracks_xy, tracks_color, tracks_in_frame = [], [], []
+            for trackid in self.tracker.active_tracks:
+                track = self.tracker.active_tracks[trackid]
+                xy = np.array(track.pos_history)
+                is_track_in_frame = True
+                if trackid in self.tracker.latest_matches:
+                    color = (0.,1.,0.,1.) # green
+                elif trackid in self.tracker.new_tracks:
+                    color = (0.,0.,1.,1.) # blue
+                else:
+                    color = (0.7, 0.7, 0.7, 1.)
+                    is_track_in_frame = False
+                tracks_xy.append(xy)
+                tracks_color.append(color)
+                tracks_in_frame.append(is_track_in_frame)
 
         pub = rospy.Publisher("/detections", Marker, queue_size=1)
         # ...
@@ -318,6 +314,103 @@ class Clustering(object):
             mk.points.append(pt)
         ma.markers.append(mk)
         pub.publish(mk)
+
+    def publish_obstacles(self):
+        with self.lock:
+            if self.transport_data is None:
+                return
+            # tracks
+            track_ids = []
+            tracks_latest_pos, tracks_color = [], []
+            tracks_in_frame, tracks_velocities = [], []
+            for trackid in self.tracker.active_tracks:
+                track = self.tracker.active_tracks[trackid]
+                xy = np.array(track.pos_history[-1])
+                is_track_in_frame = True
+                if trackid in self.tracker.latest_matches:
+                    color = (0.,1.,0.,1.) # green
+                elif trackid in self.tracker.new_tracks:
+                    color = (0.,0.,1.,1.) # blue
+                else:
+                    color = (0.7, 0.7, 0.7, 1.)
+                    is_track_in_frame = False
+                track_ids.append(trackid)
+                tracks_latest_pos.append(xy)
+                tracks_color.append(color)
+                tracks_in_frame.append(is_track_in_frame)
+                tracks_velocities.append(track.estimate_velocity())
+
+        pub = rospy.Publisher('/obstacles', ObstacleArrayMsg, queue_size=1)
+        obstacles_msg = ObstacleArrayMsg() 
+        obstacles_msg.header.stamp = rospy.Time.now()
+        obstacles_msg.header.frame_id = self.kFixedFrame
+        for trackid, xy, in_frame, vel in zip(track_ids, tracks_latest_pos, tracks_in_frame, tracks_velocities):
+            if not in_frame:
+                continue
+            # Add point obstacle
+            obst = ObstacleMsg()
+            obst.id = trackid
+            obst.polygon.points = [Point32()]
+            obst.polygon.points[0].x = xy[0]
+            obst.polygon.points[0].y = xy[1]
+            obst.polygon.points[0].z = 0
+
+            yaw = np.arctan2(vel[1], vel[0])
+            q = tf.transformations.quaternion_from_euler(0,0,yaw)
+            obst.orientation = Quaternion(*q)
+
+            obst.velocities.twist.linear.x = vel[0]
+            obst.velocities.twist.linear.y = vel[1]
+            obst.velocities.twist.linear.z = 0
+            obst.velocities.twist.angular.x = 0
+            obst.velocities.twist.angular.y = 0
+            obst.velocities.twist.angular.z = 0
+            obstacles_msg.obstacles.append(obst)
+        pub.publish(obstacles_msg)
+
+        pub = rospy.Publisher('/obstacle_markers', MarkerArray, queue_size=1)
+        # delete all markers
+        ma = MarkerArray()
+        mk = Marker()
+        mk.header.frame_id = self.kFixedFrame
+        mk.ns = "obstacles"
+        mk.id = 0
+        mk.type = 0 # ARROW
+        mk.action = 3 # deleteall
+        ma.markers.append(mk)
+        pub.publish(ma)
+        # publish tracks
+        ma = MarkerArray()
+        id_ = 0
+        # track endpoint
+        for trackid, xy, in_frame, vel in zip(track_ids, tracks_latest_pos, tracks_in_frame, tracks_velocities):
+            if not in_frame:
+                continue
+            normvel = np.linalg.norm(vel)
+            if normvel == 0:
+                continue
+            mk = Marker()
+            mk.header.frame_id = self.kFixedFrame
+            mk.ns = "tracks"
+            mk.id = trackid
+            mk.type = 0 # ARROW
+            mk.action = 0
+            mk.scale.x = np.linalg.norm(vel)
+            mk.scale.y = 0.1
+            mk.scale.z = 0.1
+            mk.color.r = color[0]
+            mk.color.g = color[1]
+            mk.color.b = color[2]
+            mk.color.a = color[3]
+            mk.frame_locked = True
+            mk.pose.position.x = xy[0]
+            mk.pose.position.y = xy[1]
+            mk.pose.position.z = 0.03
+            yaw = np.arctan2(vel[1], vel[0])
+            q = tf.transformations.quaternion_from_euler(0,0,yaw)
+            mk.pose.orientation = Quaternion(*q)
+            ma.markers.append(mk)
+        pub.publish(ma)
 
 
 def parse_args():

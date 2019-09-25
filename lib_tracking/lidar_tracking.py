@@ -37,6 +37,28 @@ class Track(object):
             return dist_from_last_pos
         return match_error
 
+    def estimate_velocity(self):
+        current_vel_estimate = np.array([0., 0.])
+        # default estimate
+        if len(self.time_history) < 2:
+            return current_vel_estimate
+        # get average velocity over last 2 seconds
+        two_sec_pos_history = []
+        two_sec_time_history = []
+        MAX_PAST = rospy.Duration(2.)
+        latest_time = self.time_history[-1]
+        for pos, time in zip(self.pos_history, self.time_history):
+            if (latest_time - time) > MAX_PAST:
+                continue
+            two_sec_pos_history.append(pos)
+            two_sec_time_history.append(time.to_sec())
+        # instantaneous velocities at each point in history
+        pos_deltas = np.diff(two_sec_pos_history, axis=0)
+        t_deltas = np.diff(two_sec_time_history, axis=0)
+        instant_velocities = pos_deltas / t_deltas[:, None]
+        current_vel_estimate = np.mean(instant_velocities, axis=0)
+        return current_vel_estimate
+
 class Tracker(object):
     def __init__(self, args):
         self.args = args

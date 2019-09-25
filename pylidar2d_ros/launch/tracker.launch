@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<launch>
+  <node pkg="ros_run_command" type="ros_run_command" name="python_tracker" output="screen"
+    args="python $(find pylidar2d_ros)/scripts/ros_tracker_example.py --fixed-frame gmap">
+    <remap from="/obstacles" to="/move_base/TebLocalPlannerROS/obstacles"/>
+  </node>
+</launch>
+
+
