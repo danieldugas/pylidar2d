@@ -58,7 +58,8 @@ class Clustering(object):
         # visuals 
         self.fig = plt.figure("clusters")
         try:
-            self.visuals_loop()
+#             self.visuals_loop()
+            rospy.spin()
         except KeyboardInterrupt:
             print("Keyboard interrupt - shutting down.")
             rospy.signal_shutdown('KeyboardInterrupt')
