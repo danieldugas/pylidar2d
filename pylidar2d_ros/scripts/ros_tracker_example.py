@@ -172,7 +172,8 @@ class Clustering(object):
                 is_legs.append(is_leg)
 
 
-            self.transport_data = (xx, yy, clusters, is_legs, cogs, radii, self.tf_rob_in_fix)
+            timestamp = msg.header.stamp
+            self.transport_data = (timestamp, xx, yy, clusters, is_legs, cogs, radii, self.tf_rob_in_fix)
 
             leg_cogs_in_fix = []
             leg_radii = []
@@ -200,7 +201,7 @@ class Clustering(object):
                     plt.pause(0.1)
                     rospy.timer.sleep(0.01)
                     continue
-                xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
+                _, xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
                 # transform data to fixed frame
                 pose2d_rob_in_fix = Pose2D(tf_rob_in_fix)
                 xy_f = apply_tf(np.vstack([xx, yy]).T, pose2d_rob_in_fix)
@@ -249,7 +250,7 @@ class Clustering(object):
         with self.lock:
             if self.transport_data is None:
                 return
-            xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
+            timestamp, xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
             # transform data to fixed frame
             pose2d_rob_in_fix = Pose2D(tf_rob_in_fix)
             xy_f = apply_tf(np.vstack([xx, yy]).T, pose2d_rob_in_fix)
@@ -376,10 +377,13 @@ class Clustering(object):
         with self.lock:
             if self.transport_data is None:
                 return
+            # non-leg obstacles
+            timestamp, xx, yy, clusters, is_legs, cogs, radii, tf_rob_in_fix = self.transport_data
             # tracks
             track_ids = []
             tracks_latest_pos, tracks_color = [], []
             tracks_in_frame, tracks_velocities = [], []
+            tracks_radii = []
             for trackid in self.tracker.active_tracks:
                 track = self.tracker.active_tracks[trackid]
                 xy = np.array(track.pos_history[-1])
@@ -396,12 +400,13 @@ class Clustering(object):
                 tracks_color.append(color)
                 tracks_in_frame.append(is_track_in_frame)
                 tracks_velocities.append(track.estimate_velocity())
+                tracks_radii.append(track.avg_radius())
 
         pub = rospy.Publisher('/obstacles', ObstacleArrayMsg, queue_size=1)
         obstacles_msg = ObstacleArrayMsg() 
-        obstacles_msg.header.stamp = rospy.Time.now()
+        obstacles_msg.header.stamp =  timestamp
         obstacles_msg.header.frame_id = self.kFixedFrame
-        for trackid, xy, in_frame, vel in zip(track_ids, tracks_latest_pos, tracks_in_frame, tracks_velocities):
+        for trackid, xy, in_frame, vel, radius in zip(track_ids, tracks_latest_pos, tracks_in_frame, tracks_velocities, tracks_radii):
             if not in_frame:
                 continue
             # Add point obstacle
@@ -412,12 +417,52 @@ class Clustering(object):
             obst.polygon.points[0].y = xy[1]
             obst.polygon.points[0].z = 0
 
+            obst.radius = radius
+
             yaw = np.arctan2(vel[1], vel[0])
             q = tf.transformations.quaternion_from_euler(0,0,yaw)
             obst.orientation = Quaternion(*q)
 
             obst.velocities.twist.linear.x = vel[0]
             obst.velocities.twist.linear.y = vel[1]
+            obst.velocities.twist.linear.z = 0
+            obst.velocities.twist.angular.x = 0
+            obst.velocities.twist.angular.y = 0
+            obst.velocities.twist.angular.z = 0
+            obstacles_msg.obstacles.append(obst)
+        pub.publish(obstacles_msg)
+
+        pub = rospy.Publisher('/close_nonleg_obstacles', ObstacleArrayMsg, queue_size=1)
+        MAX_DIST_STATIC_CLUSTERS_M = 3.
+        cogs_in_fix = []
+        for i in range(len(cogs)):
+            cogs_in_fix.append(apply_tf(cogs[i], Pose2D(tf_rob_in_fix)))
+        obstacles_msg = ObstacleArrayMsg() 
+        obstacles_msg.header.stamp = timestamp
+        obstacles_msg.header.frame_id = self.kFixedFrame
+        for cog_in_fix, cog_in_rob, r, is_leg in zip(cogs_in_fix, cogs, radii, is_legs):
+            # leg obstacles are already published in the tracked obstacles topic
+            if is_leg:
+                continue
+            # close obstacles only
+            if np.linalg.norm(cog_in_rob) > MAX_DIST_STATIC_CLUSTERS_M:
+                continue
+            # Add point obstacle
+            obst = ObstacleMsg()
+            obst.id = trackid
+            obst.polygon.points = [Point32()]
+            obst.polygon.points[0].x = cog_in_fix[0]
+            obst.polygon.points[0].y = cog_in_fix[1]
+            obst.polygon.points[0].z = 0
+
+            obst.radius = r
+
+            yaw = 0
+            q = tf.transformations.quaternion_from_euler(0,0,yaw)
+            obst.orientation = Quaternion(*q)
+
+            obst.velocities.twist.linear.x = 0
+            obst.velocities.twist.linear.y = 0
             obst.velocities.twist.linear.z = 0
             obst.velocities.twist.angular.x = 0
             obst.velocities.twist.angular.y = 0
