@@ -1,30 +1,63 @@
 #!/usr/bin/env python
 from copy import deepcopy
+from costmap_converter.msg import ObstacleArrayMsg, ObstacleMsg
+from geometry_msgs.msg import Twist, Quaternion
+from geometry_msgs.msg import Point, Point32, Twist
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
+from nav_msgs.msg import Odometry, Path
+from pose2d import Pose2D, apply_tf, apply_tf_to_pose, inverse_pose2d
 import rospy
-import tf
-import threading
 from sensor_msgs.msg import LaserScan
+from std_srvs.srv import Trigger, TriggerResponse
 import signal
 import sys
-from costmap_converter.msg import ObstacleArrayMsg, ObstacleMsg
-from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import Twist, Quaternion
+import tf
+import threading
 from timeit import default_timer as timer
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point, Point32, Twist
-from std_srvs.srv import Trigger, TriggerResponse
+from CMap2D import CMap2D
 
 # local packages
-from pose2d import Pose2D, apply_tf, apply_tf_to_pose, inverse_pose2d
 import lidar_clustering
 from lib_tracking.lidar_tracking import Tracker
 
 N_PAST_POS = 100
 
 
+class ReferenceMapAndLocalizationManager(object):
+    """ If a reference map is provided and a tf exists,
+    keeps track of the tf for given frame in the reference map frame """
+    def __init__(self, map_folder, map_filename, reference_map_frame, frame_to_track):
+        self.tf_frame_in_refmap = None
+        self.map_ = None
+        self.map_as_tsdf = None
+        # loads map based on ros params
+        folder = map_folder
+        filename =  map_filename
+        try:
+            self.map_ = CMap2D(folder, filename)
+        except IOError as e:
+            rospy.logwarn(rospy.get_namespace())
+            rospy.logwarn("Failed to load reference map. Make sure {}.yaml and {}.pgm"
+                   " are in the {} folder.".format(filename, filename, folder))
+            rospy.logwarn("Disabling. No global localization or reference map will be available.")
+            return
+        # get frame info
+        self.kRefMapFrame = reference_map_frame
+        self.kFrame = frame_to_track
+        # launch callbacks
+        self.tf_listener = tf.TransformListener()
+        rospy.Timer(rospy.Duration(0.01), self.tf_callback)
+        self.map_as_tsdf = self.map_.as_sdf()
+
+    def tf_callback(self, event=None):
+        try:
+             self.tf_frame_in_refmap = self.tf_listener.lookupTransform(self.kRefMapFrame, self.kFrame, rospy.Time(0))
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(10., e)
+            return
 
 class Clustering(object):
     def __init__(self, args):
@@ -50,6 +83,11 @@ class Clustering(object):
         # tf
         self.tf_listener = tf.TransformListener()
         self.tf_br = tf.TransformBroadcaster()
+        # Localization Manager
+        mapname = rospy.get_param("/python_tracker/reference_map_name", "map")
+        mapframe = rospy.get_param("/python_tracker/reference_map_frame", "reference_map")
+        mapfolder = rospy.get_param("/python_tracker/reference_map_folder", "~/maps")
+        self.refmap_manager = ReferenceMapAndLocalizationManager(mapfolder, mapname, mapframe, self.kFixedFrame)
         # Timers
         rospy.Timer(rospy.Duration(0.001), self.tf_callback)
         # data
@@ -115,8 +153,24 @@ class Clustering(object):
             toc = timer()
             cog_radii_time = toc-tic
 
+            # in fixed frame
+            cogs_in_fix = []
+            for i in range(len(cogs)):
+                cogs_in_fix.append(apply_tf(cogs[i], Pose2D(self.tf_rob_in_fix)))
+
             # legs
-            is_legs = [True if 0.03 < r and r < 0.15 and len(c) >= MIN_CLUSTER_SIZE else False for r, c in zip(radii, clusters)]
+            is_legs = []
+            for r, c, cog_in_fix in zip(radii, clusters, cogs_in_fix):
+                is_leg = True if 0.03 < r and r < 0.15 and len(c) >= MIN_CLUSTER_SIZE else False
+                # if a reference map and localization are available, filter detections which are in map
+                if self.refmap_manager.tf_frame_in_refmap is not None:
+                    cog_in_refmap = apply_tf(cog_in_fix, Pose2D(self.refmap_manager.tf_frame_in_refmap))
+                    ij = cog_in_refmap_ij = self.refmap_manager.map_.xy_to_ij([cog_in_refmap])[0]
+                    # the distance between the c.o.g. and the nearest obstacle in the refmap
+                    if self.refmap_manager.map_as_tsdf[ij[0], ij[1]] < r:
+                        is_leg = False
+                is_legs.append(is_leg)
+
 
             self.transport_data = (xx, yy, clusters, is_legs, cogs, radii, self.tf_rob_in_fix)
 
@@ -124,7 +178,7 @@ class Clustering(object):
             leg_radii = []
             for i in range(len(is_legs)):
                 if is_legs[i]:
-                    leg_cogs_in_fix.append(apply_tf(cogs[i], Pose2D(self.tf_rob_in_fix)))
+                    leg_cogs_in_fix.append(cogs_in_fix[i])
                     leg_radii.append(radii[i])
 
             # Tracks
@@ -207,6 +261,7 @@ class Clustering(object):
                     pose2d_past_in_fix.append(Pose2D(tf_a))
             # tracks
             tracks_xy, tracks_color, tracks_in_frame = [], [], []
+            tracks_avg_r = []
             for trackid in self.tracker.active_tracks:
                 track = self.tracker.active_tracks[trackid]
                 xy = np.array(track.pos_history)
@@ -221,6 +276,7 @@ class Clustering(object):
                 tracks_xy.append(xy)
                 tracks_color.append(color)
                 tracks_in_frame.append(is_track_in_frame)
+                tracks_avg_r.append(track.avg_radius())
 
         pub = rospy.Publisher("/detections", Marker, queue_size=1)
         # ...
@@ -271,7 +327,7 @@ class Clustering(object):
                 mk.points.append(pt)
             ma.markers.append(mk)
         # track endpoint
-        for color, xy in zip(tracks_color, tracks_xy):
+        for color, xy, r in zip(tracks_color, tracks_xy, tracks_avg_r):
             x, y = xy[-1]
             mk = Marker()
             mk.header.frame_id = self.kFixedFrame
@@ -280,8 +336,8 @@ class Clustering(object):
             id_+=1
             mk.type = 3 # CYLINDER
             mk.action = 0
-            mk.scale.x = 0.1
-            mk.scale.y = 0.1
+            mk.scale.x = r * 2.
+            mk.scale.y = r * 2.
             mk.scale.z = 0.1
             mk.color.r = color[0]
             mk.color.g = color[1]

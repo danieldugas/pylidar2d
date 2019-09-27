@@ -59,6 +59,11 @@ class Track(object):
         current_vel_estimate = np.mean(instant_velocities, axis=0)
         return current_vel_estimate
 
+    def avg_radius(self):
+        if self.n_hits == 0:
+            return None
+        return 1. * self.sum_radius / self.n_hits
+
 class Tracker(object):
     def __init__(self, args):
         self.args = args

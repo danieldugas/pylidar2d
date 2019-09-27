@@ -12,15 +12,18 @@
     <arg name="output" value="log"/>
   </include>
   <include file="$(find map_matcher)/launch/map_matcher.launch">
+    <arg name="output" value="log" />
     <arg name="slam_map_topic" value="/gmap"/>
     <arg name="reference_map_name" value="$(arg mapname)"/>
     <arg name="maps_folder" value="$(env HOME)/maps"/>
   </include>
 
   <!-- Tracker -->
+  <!-- have to use param in absolute namespace / due to ros_run_command not forwarding node namespace to script -->
   <node pkg="ros_run_command" type="ros_run_command" name="python_tracker" output="screen"
-    args="python $(find pylidar2d_ros)/scripts/ros_tracker_example.py --hz --fixed-frame gmap"
-  />
+    args="python $(find pylidar2d_ros)/scripts/ros_tracker_example.py --hz --fixed-frame gmap">
+    <param name="reference_map_name" value="$(arg mapname)"/>
+  </node>
 
 </launch>
 
