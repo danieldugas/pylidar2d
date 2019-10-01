@@ -2,7 +2,7 @@
 from copy import deepcopy
 from costmap_converter.msg import ObstacleArrayMsg, ObstacleMsg
 from geometry_msgs.msg import Twist, Quaternion
-from geometry_msgs.msg import Point, Point32, Twist
+from geometry_msgs.msg import Point, Point32, Twist, PoseStamped
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -127,7 +127,19 @@ class Clustering(object):
                 return
             # TODO check that odom and tf are not old
 
+            # add current position to path history
+            PATH_HISTORY_RESOLUTION = 0.05 # m
             self.tf_pastrobs_in_fix.append(self.tf_rob_in_fix)
+            # downsample if too large
+            if len(self.tf_pastrobs_in_fix) > N_PAST_POS:
+                keep = [0]
+                for i in range(len(self.tf_pastrobs_in_fix)):
+                    latest_xy = np.array(self.tf_pastrobs_in_fix[keep[-1]][0][:2])
+                    xy = np.array(self.tf_pastrobs_in_fix[i][0][:2])
+                    if np.linalg.norm(xy-latest_xy) > PATH_HISTORY_RESOLUTION:
+                        keep.append(i)
+                self.tf_pastrobs_in_fix = [self.tf_pastrobs_in_fix[i] for i in keep]
+            # strict x2 downsample if still too large
             if len(self.tf_pastrobs_in_fix) > 2*N_PAST_POS:
                 self.tf_pastrobs_in_fix = self.tf_pastrobs_in_fix[::2]
 
@@ -352,27 +364,18 @@ class Clustering(object):
             ma.markers.append(mk)
         pub.publish(ma)
 
-        pub = rospy.Publisher("/robot_track", Marker, queue_size=1)
-        mk = Marker()
-        mk.header.frame_id = self.kFixedFrame
-        mk.ns = "robot_track"
-        mk.id = 0
-        mk.type = 4 # LINE_STRIP
-        mk.action = 0
-        mk.scale.x = 0.02
-        mk.color.r = 1
-        mk.color.g = 0
-        mk.color.b = 0
-        mk.color.a = 1
-        mk.frame_locked = True
+        pub = rospy.Publisher("/robot_track", Path, queue_size=1)
+        path_msg = Path()
+        path_msg.header.stamp = rospy.Time.now()
+        path_msg.header.frame_id = self.kFixedFrame
         for x, y, _ in pose2d_past_in_fix:
-            pt = Point()
-            pt.x = x
-            pt.y = y
-            pt.z = 0.03
-            mk.points.append(pt)
-        ma.markers.append(mk)
-        pub.publish(mk)
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = path_msg.header.stamp # TODO log actual time
+            pose_msg.header.frame_id = path_msg.header.frame_id
+            pose_msg.pose.position.x = x
+            pose_msg.pose.position.y = y
+            path_msg.poses.append(pose_msg)
+        pub.publish(path_msg)
 
     def publish_obstacles(self):
         with self.lock:

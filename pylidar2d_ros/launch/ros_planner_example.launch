@@ -6,6 +6,8 @@
 
   <!-- Rosbag -->
   <include file="$(find asl_pepper_rosbags)/launch/$(arg rosbag).launch">
+    <arg name="mapname" value="$(arg mapname)" if="$(eval arg('rosbag') == 'simulator')"/>
+    <arg name="mapfolder" value="$(arg mapfolder)" if="$(eval arg('rosbag') == 'simulator')"/>
   </include>
 
   <!-- Gmapping & Map Matching -->

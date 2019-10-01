@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 from nav_msgs.msg import Odometry, Path
-from pose2d import Pose2D, apply_tf, apply_tf_to_pose, inverse_pose2d
+from pose2d import Pose2D, apply_tf, apply_tf_to_pose, inverse_pose2d, apply_tf_to_vel
 import rospy
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Trigger, TriggerResponse
@@ -84,6 +84,7 @@ class Planning(object):
         self.obstacles_buffer = []
         self.static_obstacles_buffer = None
         self.transport_data = None
+        self.STOP = False # DEBUG True
         # ROS
         rospy.init_node('clustering', anonymous=True)
         rospy.Subscriber(self.kObstaclesTopic, ObstacleArrayMsg, self.obstacles_callback, queue_size=1)
@@ -178,7 +179,9 @@ class Planning(object):
             dynamic_obstacles = []
             self.obstacles_buffer = [obst_msg for obst_msg in self.obstacles_buffer
                     if nowstamp - obst_msg.header.stamp < rospy.Duration(k2s)]
-            for obst_msg in self.obstacles_buffer:
+            # DEBUG remove
+#             for obst_msg in self.obstacles_buffer:
+            for obst_msg in self.obstacles_buffer[-1:]:
                 dynamic_obstacles.extend(obst_msg.obstacles)
             # take into account static obstacles if not old
             static_obstacles = []
@@ -188,7 +191,9 @@ class Planning(object):
             # vel to goal in fix
             goal_in_fix = np.array(Pose2D(self.tf_wpt_in_fix)[:2])
             toc = timer()
-            print("Lock preproc {} ms".format( (toc-tic) * 1000. ))
+            print("Lock preproc {:.1f} ms".format( (toc-tic) * 1000. ))
+            # robot position
+            tf_rob_in_fix = self.tf_rob_in_fix
 
         tic = timer()
 
@@ -201,7 +206,7 @@ class Planning(object):
 
         # create agents for RVO
         # first agent is the robot
-        positions.append(Pose2D(self.tf_rob_in_fix)[:2])
+        positions.append(Pose2D(tf_rob_in_fix)[:2])
         radii.append(self.kRadius)
         velocities.append([self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y])
         metadata.append({'source': 'robot'})
@@ -211,30 +216,35 @@ class Planning(object):
             radii.append(obst.radius)
             velocities.append( [obst.velocities.twist.linear.x, obst.velocities.twist.linear.y] )
             metadata.append({'source': 'dynamic'})
-        # create agents for local static obstacles
+        # create agents for local static obstacles (table leg, chair, etc)
         for obst in static_obstacles:
+            if obst.radius > 0.5:
+                continue # TODO big walls make big circles : but dangerous to do this! 
             positions.append([obst.polygon.points[0].x, obst.polygon.points[0].y])
             radii.append(obst.radius)
             velocities.append( [obst.velocities.twist.linear.x, obst.velocities.twist.linear.y] )
             metadata.append({'source': 'nonleg'})
 
-        # create static obstacle vertices from refmap if available
+        # create static obstacle vertices from refmap if available (walls, etc)
         if self.refmap_manager.tf_frame_in_refmap is not None:
-            kFiveMeters = 5.
+            kMapObstMaxDist = 3.
             obstacles_in_ref = self.refmap_manager.map_as_closed_obstacles
             pose2d_ref_in_fix = inverse_pose2d(Pose2D(self.refmap_manager.tf_frame_in_refmap))
             near_obstacles = [apply_tf(vertices, pose2d_ref_in_fix) for vertices in obstacles_in_ref 
-                              if len(vertices) > 1 and np.mean(np.linalg.norm(vertices, axis=1)) < kFiveMeters]
-#             obstacles = near_obstacles
+                              if len(vertices) > 1]
+            near_obstacles = [vertices for vertices in near_obstacles 
+                              if np.mean(np.linalg.norm(
+                                  vertices - np.array(positions[0]), axis=1)) < kMapObstMaxDist]
+            obstacles = near_obstacles
 
         toc = timer()
-        print("Pre-RVO {} ms".format( (toc-tic) * 1000. ))
+        print("Pre-RVO {:.1f} ms".format( (toc-tic) * 1000. ))
         tic = timer()
 
         # RVO ----------------
         import rvo2
-        t_horizon = 5.
-        DT = 1/60.
+        t_horizon = 10.
+        DT = 1/10.
         #RVOSimulator(timeStep, neighborDist, maxNeighbors, timeHorizon, timeHorizonObst, radius, maxSpeed, velocity = [0,0]);
         sim = rvo2.PyRVOSimulator(DT, 1.5, 5, 1.5, 2, 0.4, 2)
 
@@ -242,9 +252,13 @@ class Planning(object):
         # the default values passed to the PyRVOSimulator constructor),
         # or pass all available parameters.
         agents = []
-        for p, v, r in zip(positions, velocities, radii):
+        for p, v, r, m in zip(positions, velocities, radii, metadata):
             #addAgent(posxy, neighborDist, maxNeighbors, timeHorizon, timeHorizonObst, radius, maxSpeed, velocity = [0,0]);
-            agents.append(sim.addAgent(tuple(p), radius=r, velocity=tuple(v)))
+            a = sim.addAgent(tuple(p), radius=r, velocity=tuple(v))
+            agents.append(a)
+            # static agents can't move
+            if m['source'] != 'robot' and np.linalg.norm(v) == 0:
+                sim.setAgentMaxSpeed(a, 0)
 
         # Obstacle(list of vertices), anticlockwise (clockwise for bounding obstacle)
         for vert in obstacles:
@@ -252,7 +266,7 @@ class Planning(object):
         sim.processObstacles()
 
         toc = timer()
-        print("RVO init {} ms".format( (toc-tic) * 1000. ))
+        print("RVO init {:.1f} ms".format( (toc-tic) * 1000. ))
         tic = timer()
 
         n_steps = int(t_horizon / DT)
@@ -266,7 +280,6 @@ class Planning(object):
                 pref_vel = velocities[i] # assume agents want to keep initial vel
                 if i == 0:
                     vector_to_goal = goal_in_fix - np.array(sim.getAgentPosition(a))
-
                     pref_vel = self.kIdealVelocity * vector_to_goal / np.linalg.norm(vector_to_goal)
                 sim.setAgentPrefVelocity(a, tuple(pref_vel))
                 pred_tracks[i].append(sim.getAgentPosition(a))
@@ -276,7 +289,7 @@ class Planning(object):
         # -------------------------
         toc = timer()
         print("RVO steps {} - {} agents - {} obstacles".format(step, len(agents), len(obstacles)))
-        print("RVO sim {} ms".format( (toc-tic) * 1000. ))
+        print("RVO sim {:.1f} ms".format( (toc-tic) * 1000. ))
 
 
         # PLOT ---------------------------
@@ -304,9 +317,10 @@ class Planning(object):
         id_ = 0
         end_x = [sim.getAgentPosition(agent_no)[0] for agent_no in agents]
         end_y = [sim.getAgentPosition(agent_no)[1] for agent_no in agents]
+        end_t = pred_t[-1]
         for i in range(len(agents)):
             color = (0,0,0,1) # black
-            color = (0,1,0,1) if metadata[i]['source'] == 'robot' else color # green
+            color = (1,.8,0,1) if metadata[i]['source'] == 'robot' else color # green
             color = (1,0,0,1) if metadata[i]['source'] == 'dynamic' else color # red
             color = (0,0,1,1) if metadata[i]['source'] == 'nonleg' else color # blue
             # track line
@@ -325,11 +339,11 @@ class Planning(object):
             mk.frame_locked = True
             xx = np.array(pred_tracks[i])[:,0]
             yy = np.array(pred_tracks[i])[:,1]
-            for x, y in zip(xx, yy):
+            for x, y, t in zip(xx, yy, pred_t):
                 pt = Point()
                 pt.x = x
                 pt.y = y
-                pt.z = 0.03
+                pt.z = t / t_horizon
                 mk.points.append(pt)
             ma.markers.append(mk)
             # endpoint
@@ -351,13 +365,44 @@ class Planning(object):
             mk.frame_locked = True
             mk.pose.position.x = end_x[i]
             mk.pose.position.y = end_y[i]
-            mk.pose.position.z = 0.03
+            mk.pose.position.z = end_t / t_horizon
             ma.markers.append(mk)
         pub.publish(ma)
 
 
+        pred_rob_vel_in_fix = np.array(pred_vels[0][1]) # 2 is a cheat because 0 is usually the current speed
+        pred_end_in_fix = np.array([end_x[0], end_y[0]])
+        # in robot frame
+        pose2d_fix_in_rob = inverse_pose2d(Pose2D(tf_rob_in_fix))
+        pred_rob_vel_in_rob = apply_tf_to_vel(np.array(list(pred_rob_vel_in_fix) + [0]),
+                                              pose2d_fix_in_rob)[:2]
+        pred_end_in_rob = apply_tf(pred_end_in_fix, pose2d_fix_in_rob)
         # resulting command vel, and path
+        best_u, best_v = pred_rob_vel_in_rob
+        # check if goal is reached
+        if np.linalg.norm(pred_end_in_rob) < 0.5:
+            best_u, best_v = (0, 0)
 
+
+        # Slow turn towards goal
+        # TODO
+        best_w = 0
+        WMAX = 0.5
+        gx, gy = pred_end_in_rob
+        angle_to_goal = np.arctan2(gy, gx) # [-pi, pi]
+        if np.sqrt(gx * gx + gy * gy) > 0.5: # turn only if goal is far away
+            if np.abs(angle_to_goal) > (np.pi / 4/ 10): # deadzone
+                best_w = np.clip(angle_to_goal, -WMAX, WMAX) # linear ramp
+
+
+        cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        if not self.STOP:
+            # publish cmd_vel
+            cmd_vel_msg = Twist()
+            cmd_vel_msg.linear.x = best_u
+            cmd_vel_msg.linear.y = best_v
+            cmd_vel_msg.angular.z = best_w
+            cmd_vel_pub.publish(cmd_vel_msg)
 
     def waypoint_callback(self, msg):
         self.tf_timeout = rospy.Duration(0.1)
