@@ -2,7 +2,7 @@
 from copy import deepcopy
 from costmap_converter.msg import ObstacleArrayMsg, ObstacleMsg
 from geometry_msgs.msg import Twist, Quaternion
-from geometry_msgs.msg import Point, Point32, Twist
+from geometry_msgs.msg import Point, Point32, Twist, PoseStamped
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -14,6 +14,7 @@ from std_srvs.srv import Trigger, TriggerResponse
 import signal
 import sys
 import tf
+from tf2_ros import TransformException
 import threading
 from timeit import default_timer as timer
 from visualization_msgs.msg import Marker, MarkerArray
@@ -32,7 +33,6 @@ class ReferenceMapAndLocalizationManager(object):
     def __init__(self, map_folder, map_filename, reference_map_frame, frame_to_track):
         self.tf_frame_in_refmap = None
         self.map_ = None
-        self.map_as_tsdf = None
         # loads map based on ros params
         folder = map_folder
         filename =  map_filename
@@ -50,7 +50,8 @@ class ReferenceMapAndLocalizationManager(object):
         # launch callbacks
         self.tf_listener = tf.TransformListener()
         rospy.Timer(rospy.Duration(0.01), self.tf_callback)
-        self.map_as_tsdf = self.map_.as_sdf()
+        self.map_as_closed_obstacles = self.map_.as_closed_obst_vertices()
+        rospy.loginfo("cache computed")
 
     def tf_callback(self, event=None):
         try:
@@ -64,9 +65,11 @@ class Planning(object):
         self.args = args
         # consts
         self.kLidarTopic = args.scan_topic
+        self.kRadius = rospy.get_param("~/robot_radius", 0.4)
+        self.kIdealVelocity = rospy.get_param("~/ideal_velocity", 0.3)
         self.kFixedFrameTopic = "/pepper_robot/odom"
         self.kCmdVelTopic = "/cmd_vel"
-        self.kGlobalPathTopic = "/planner/GlobalPath"
+        self.kWaypointTopic = "/global_planner/current_waypoint"
         self.kObstaclesTopic = "/obstacles"
         self.kStaticObstaclesTopic = "/close_nonleg_obstacles"
         self.kFixedFrame = args.fixed_frame # ideally something truly fixed, like /map
@@ -75,17 +78,18 @@ class Planning(object):
         # vars
         self.odom = None
         self.tf_rob_in_fix = None
+        self.tf_wpt_in_fix = None
         self.tracker = Tracker(args)
         self.lock = threading.Lock() # for avoiding race conditions
         self.obstacles_buffer = []
         self.static_obstacles_buffer = None
+        self.transport_data = None
         # ROS
         rospy.init_node('clustering', anonymous=True)
-        rospy.Subscriber(self.kLidarTopic, LaserScan, self.scan_callback, queue_size=1)
         rospy.Subscriber(self.kObstaclesTopic, ObstacleArrayMsg, self.obstacles_callback, queue_size=1)
         rospy.Subscriber(self.kStaticObstaclesTopic, ObstacleArrayMsg, self.static_obstacles_callback, queue_size=1)
         rospy.Subscriber(self.kFixedFrameTopic, Odometry, self.odom_callback, queue_size=1)
-        rospy.Subscriber(self.kGlobalPathTopic, Path, self.global_path_callback, queue_size=1)
+        rospy.Subscriber(self.kWaypointTopic, Marker, self.waypoint_callback, queue_size=1)
         self.pubs = [rospy.Publisher("debug{}".format(i), LaserScan, queue_size=1) for i in range(3)]
         # tf
         self.tf_listener = tf.TransformListener()
@@ -95,15 +99,11 @@ class Planning(object):
         mapframe = rospy.get_param("/python_tracker/reference_map_frame", "reference_map")
         mapfolder = rospy.get_param("/python_tracker/reference_map_folder", "~/maps")
         self.refmap_manager = ReferenceMapAndLocalizationManager(mapfolder, mapname, mapframe, self.kFixedFrame)
+        self.is_tracking_global_path = False
         # Timers
         rospy.Timer(rospy.Duration(0.001), self.tf_callback)
-        rospy.Timer(rospy.Duration(0.1), self.global_path_tracking_routine)
         rospy.Timer(rospy.Duration(0.1), self.planner_routine)
-        # data
-        self.transport_data = None
-        self.tf_pastrobs_in_fix = []
         # visuals 
-        self.fig = plt.figure("clusters")
         try:
 #             self.visuals_loop()
             rospy.spin()
@@ -111,6 +111,32 @@ class Planning(object):
             print("Keyboard interrupt - shutting down.")
             rospy.signal_shutdown('KeyboardInterrupt')
 
+    def visuals_loop(self):
+        while True:
+            # PLOT ---------------------------
+            if self.transport_data is None:
+                continue
+            sim, agents, metadata, radii, obstacles, pred_tracks = self.transport_data 
+            plt.figure("RVO")
+            plt.cla()
+            x = [sim.getAgentPosition(agent_no)[0] for agent_no in agents]
+            y = [sim.getAgentPosition(agent_no)[1] for agent_no in agents]
+            for i in range(len(agents)):
+                color = "black"
+                color = "green" if metadata[i]['source'] == 'robot' else color
+                color = "red" if metadata[i]['source'] == 'dynamic' else color
+                color = "blue" if metadata[i]['source'] == 'nonleg' else color
+                circle = plt.Circle((x[i], y[i]), radii[i], facecolor=color)
+                plt.gcf().gca().add_artist(circle)
+                # track
+                xx = np.array(pred_tracks[i])[:,0]
+                yy = np.array(pred_tracks[i])[:,1]
+                plt.plot(xx, yy, color=color)
+            for vert in obstacles:
+                plt.plot([v[0] for v in vert] + [vert[0][0]], [v[1] for v in vert] + [vert[0][1]])
+            plt.axes().set_aspect('equal')
+            plt.pause(0.1)
+            # -----------------------------
 
     def odom_callback(self, msg):
         self.odom = msg
@@ -131,25 +157,83 @@ class Planning(object):
 
     # TODO
     # plan based on 
-    # - slam map or reference map (slam map for now)
-    # - -points- clusters of size > N closer than X in scan - which are not dynamic objects
+    # - slam map or reference map (refmap for now)
+    # - -points- clusters of size > N closer than X in scan - which are not dynamic objects (N.I.Y)
     # - tracks not older than Y
     def planner_routine(self, event=None):
+        nowstamp = rospy.Time.now()
+        if self.tf_wpt_in_fix is None:
+            rospy.logwarn_throttle(10., "Global path not available yet")
+            return
+        if self.tf_rob_in_fix is None:
+            rospy.logwarn_throttle(10., "tf_rob_in_fix not available yet")
+            return
+        if self.odom is None:
+            rospy.logwarn_throttle(10., "odom not available yet")
+            return
         # remove old obstacles from buffer
+        k2s = 2.
         with self.lock:
-            self.obstacles_buffer = [obstacles for obstacles in self.obstacles_buffer
-                                if msg.header.stamp - obstacles.header.stamp > rospy.Duration(2.)]
-        # create agent for every dynamic obstacle
+            tic = timer()
+            dynamic_obstacles = []
+            self.obstacles_buffer = [obst_msg for obst_msg in self.obstacles_buffer
+                    if nowstamp - obst_msg.header.stamp < rospy.Duration(k2s)]
+            for obst_msg in self.obstacles_buffer:
+                dynamic_obstacles.extend(obst_msg.obstacles)
+            # take into account static obstacles if not old
+            static_obstacles = []
+            if self.static_obstacles_buffer is not None:
+                if (nowstamp - self.static_obstacles_buffer.header.stamp) < rospy.Duration(k2s):
+                    static_obstacles = self.static_obstacles_buffer.obstacles
+            # vel to goal in fix
+            goal_in_fix = np.array(Pose2D(self.tf_wpt_in_fix)[:2])
+            toc = timer()
+            print("Lock preproc {} ms".format( (toc-tic) * 1000. ))
 
-        # make agent 0 the robot
-        t_horizon = 5.
-        positions = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-        vert = [(0.1, 0.1), (-0.1, 0.1), (-0.1, -0.1), (0.1, -0.1)]
-        vert = np.array(vert) + [1, 0]
-        obstacles = [vert]
+        tic = timer()
+
+        # RVO set up
+        positions = []
+        radii = []
+        velocities = []
+        obstacles = []
+        metadata = [] # agent metadata
+
+        # create agents for RVO
+        # first agent is the robot
+        positions.append(Pose2D(self.tf_rob_in_fix)[:2])
+        radii.append(self.kRadius)
+        velocities.append([self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y])
+        metadata.append({'source': 'robot'})
+        # create agent for every dynamic obstacle
+        for obst in dynamic_obstacles:
+            positions.append([obst.polygon.points[0].x, obst.polygon.points[0].y])
+            radii.append(obst.radius)
+            velocities.append( [obst.velocities.twist.linear.x, obst.velocities.twist.linear.y] )
+            metadata.append({'source': 'dynamic'})
+        # create agents for local static obstacles
+        for obst in static_obstacles:
+            positions.append([obst.polygon.points[0].x, obst.polygon.points[0].y])
+            radii.append(obst.radius)
+            velocities.append( [obst.velocities.twist.linear.x, obst.velocities.twist.linear.y] )
+            metadata.append({'source': 'nonleg'})
+
+        # create static obstacle vertices from refmap if available
+        if self.refmap_manager.tf_frame_in_refmap is not None:
+            kFiveMeters = 5.
+            obstacles_in_ref = self.refmap_manager.map_as_closed_obstacles
+            pose2d_ref_in_fix = inverse_pose2d(Pose2D(self.refmap_manager.tf_frame_in_refmap))
+            near_obstacles = [apply_tf(vertices, pose2d_ref_in_fix) for vertices in obstacles_in_ref 
+                              if len(vertices) > 1 and np.mean(np.linalg.norm(vertices, axis=1)) < kFiveMeters]
+#             obstacles = near_obstacles
+
+        toc = timer()
+        print("Pre-RVO {} ms".format( (toc-tic) * 1000. ))
+        tic = timer()
 
         # RVO ----------------
         import rvo2
+        t_horizon = 5.
         DT = 1/60.
         #RVOSimulator(timeStep, neighborDist, maxNeighbors, timeHorizon, timeHorizonObst, radius, maxSpeed, velocity = [0,0]);
         sim = rvo2.PyRVOSimulator(DT, 1.5, 5, 1.5, 2, 0.4, 2)
@@ -160,131 +244,141 @@ class Planning(object):
         agents = []
         for p, v, r in zip(positions, velocities, radii):
             #addAgent(posxy, neighborDist, maxNeighbors, timeHorizon, timeHorizonObst, radius, maxSpeed, velocity = [0,0]);
-            agents.append(sim.addAgent(tuple(p), radius=r, velocity=v))
+            agents.append(sim.addAgent(tuple(p), radius=r, velocity=tuple(v)))
 
         # Obstacle(list of vertices), anticlockwise (clockwise for bounding obstacle)
         for vert in obstacles:
             o1 = sim.addObstacle(list(vert))
         sim.processObstacles()
 
+        toc = timer()
+        print("RVO init {} ms".format( (toc-tic) * 1000. ))
+        tic = timer()
 
         n_steps = int(t_horizon / DT)
         pred_tracks = [[] for a in agents]
         pred_vels = [[] for a in agents]
+        pred_t = []
         for step in range(n_steps):
             for i in range(len(agents)):
                 # TODO: early stop if agent 0 reaches goal
                 a = agents[i]
                 pref_vel = velocities[i] # assume agents want to keep initial vel
-                sim.setAgentPrefVelocity(a, pref_vel)
-                pred_tracks[i] = sim.getAgentPosition(a)
-                pred_vels[i] = sim.getAgentVelocity(a)
+                if i == 0:
+                    vector_to_goal = goal_in_fix - np.array(sim.getAgentPosition(a))
+
+                    pref_vel = self.kIdealVelocity * vector_to_goal / np.linalg.norm(vector_to_goal)
+                sim.setAgentPrefVelocity(a, tuple(pref_vel))
+                pred_tracks[i].append(sim.getAgentPosition(a))
+                pred_vels[i].append(sim.getAgentVelocity(a))
+            pred_t.append(1. *step * DT)
             sim.doStep()
         # -------------------------
+        toc = timer()
+        print("RVO steps {} - {} agents - {} obstacles".format(step, len(agents), len(obstacles)))
+        print("RVO sim {} ms".format( (toc-tic) * 1000. ))
+
+
+        # PLOT ---------------------------
+#         self.transport_data = (sim, agents, metadata, radii, obstacles, pred_tracks)
+        # -----------------------------
 
         # publish predicted tracks as paths
+        rob_track = pred_tracks[0]
+        pub = rospy.Publisher("/rvo_robot_plan", Path, queue_size=1)
+        path_msg = Path()
+        path_msg.header.stamp = nowstamp
+        path_msg.header.frame_id = self.kFixedFrame
+        for pose, t in zip(rob_track, pred_t):
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = nowstamp + rospy.Duration(t)
+            pose_msg.header.frame_id = path_msg.header.frame_id
+            pose_msg.pose.position.x = pose[0]
+            pose_msg.pose.position.y = pose[1]
+            path_msg.poses.append(pose_msg)
+        pub.publish(path_msg)
+
+        # publish tracks
+        pub = rospy.Publisher("/rvo_simulated_tracks", MarkerArray, queue_size=1)
+        ma = MarkerArray()
+        id_ = 0
+        end_x = [sim.getAgentPosition(agent_no)[0] for agent_no in agents]
+        end_y = [sim.getAgentPosition(agent_no)[1] for agent_no in agents]
+        for i in range(len(agents)):
+            color = (0,0,0,1) # black
+            color = (0,1,0,1) if metadata[i]['source'] == 'robot' else color # green
+            color = (1,0,0,1) if metadata[i]['source'] == 'dynamic' else color # red
+            color = (0,0,1,1) if metadata[i]['source'] == 'nonleg' else color # blue
+            # track line
+            mk = Marker()
+            mk.lifetime = rospy.Duration(0.1)
+            mk.header.frame_id = self.kFixedFrame
+            mk.ns = "tracks"
+            mk.id = i
+            mk.type = 4 # LINE_STRIP
+            mk.action = 0
+            mk.scale.x = 0.02
+            mk.color.r = color[0]
+            mk.color.g = color[1]
+            mk.color.b = color[2]
+            mk.color.a = color[3]
+            mk.frame_locked = True
+            xx = np.array(pred_tracks[i])[:,0]
+            yy = np.array(pred_tracks[i])[:,1]
+            for x, y in zip(xx, yy):
+                pt = Point()
+                pt.x = x
+                pt.y = y
+                pt.z = 0.03
+                mk.points.append(pt)
+            ma.markers.append(mk)
+            # endpoint
+            r = radii[i]
+            mk = Marker()
+            mk.lifetime = rospy.Duration(0.1)
+            mk.header.frame_id = self.kFixedFrame
+            mk.ns = "endpoints"
+            mk.id = i
+            mk.type = 3 # CYLINDER
+            mk.action = 0
+            mk.scale.x = r * 2.
+            mk.scale.y = r * 2.
+            mk.scale.z = 0.1
+            mk.color.r = color[0]
+            mk.color.g = color[1]
+            mk.color.b = color[2]
+            mk.color.a = color[3]
+            mk.frame_locked = True
+            mk.pose.position.x = end_x[i]
+            mk.pose.position.y = end_y[i]
+            mk.pose.position.z = 0.03
+            ma.markers.append(mk)
+        pub.publish(ma)
+
 
         # resulting command vel, and path
 
 
-    def global_path_callback(self, msg):
+    def waypoint_callback(self, msg):
+        self.tf_timeout = rospy.Duration(0.1)
         """ If a global path is received (in map frame), try to track it """
         with self.lock:
-            self.global_path = msg
-            self.is_tracking_global_path = True
-        # TODO: if new path is longer, update the progress
-        # how far is the robot current pos from goal along old path? (can be unclear as we might be off path)
-        # how far is the robot current pos from goal along new path? (easy)
-        # difference between the two is the path elongation/shortening
-        # ...
-
-    def global_path_tracking_routine(self, event):
-        """ sets the goal to a waypoint along the global path """
-        with self.lock:
-            self.WAYPOINT_DIST_STEPS = 5 # steps between closest point on path and waypoint. should translate to ~1-2m real distance. assumes evenly sampled path.
-    #         self.WAYPOINT_DIST_M = 1.
-            if not self.is_tracking_global_path:
-                return
-            ## transform path to fixed frame
+            ref_frame = msg.header.frame_id
+            wpt_ref_xy = [msg.pose.position.x, msg.pose.position.y]
             try:
-                 tf_path_in_fix = self.tf_listener.lookupTransform(
-                         self.kFixedFrame,
-                         self.global_path.header.frame_id,
-                         self.global_path.header.stamp - rospy.Duration(0.1))
-                 tf_rob_in_fix = self.tf_listener.lookupTransform(self.kFixedFrame, self.kRobotFrame, rospy.Time(0))
-            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-                print("Could not set goal from global path:")
-                print(e)
+                time = rospy.Time.now()
+                tf_info = [self.kFixedFrame, msg.header.frame_id, time]
+                self.tf_listener.waitForTransform(*(tf_info + [self.tf_timeout]))
+                tf_ref_in_fix = self.tf_listener.lookupTransform(*tf_info)
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException,
+                    TransformException) as e:
+                rospy.logwarn("[{}.{}] tf to refmap frame for time {}.{} not found: {}".format(
+                    rospy.Time.now().secs, rospy.Time.now().nsecs, time.secs, time.nsecs, e))
                 return
-            # path in path frame
-            gp_xy = np.array(
-                    [[pose_st.pose.position.x, pose_st.pose.position.y]
-                      for pose_st in self.global_path.poses]
-                    )
-            # path in fixed frame
-            gp_fix_xy = apply_tf(gp_xy, Pose2D(tf_path_in_fix))
-            # distance to goal along path
-            gp_dtg = np.array([pose_st.pose.position.z for pose_st in self.global_path.poses])
-            ## robot xy in fixed frame
-            rob_fix_xy =  Pose2D(tf_rob_in_fix)[:2]
-            ## check if goal has been reached
-            if np.linalg.norm(rob_fix_xy - gp_fix_xy[-1]) < 1.:
-                print("global_goal reached")
-                # set goal as global goal and stop tracking
-                self.is_tracking_global_path = False
-                self.waypoint_dtg = None
-                wpt_fix_xy = gp_fix_xy[-1]
-                self.tf_goal_in_fix = (np.array([wpt_fix_xy[0], wpt_fix_xy[1], 0.]), # trans
-                                       tf.transformations.quaternion_from_euler(0,0,0)) # quat
-                return
-            ## if waypoint is not set yet, set waypoint one meter from the robot along the path
-            if self.waypoint_dtg is None:
-                # walk N steps forwards from start of path
-                waypoint_id = min(len(gp_dtg)-1, self.WAYPOINT_DIST_STEPS)
-                self.waypoint_dtg = gp_dtg[waypoint_id]
-                # set waypoint 
-                wpt_fix_xy = gp_fix_xy[waypoint_id]
-                self.tf_goal_in_fix = (np.array([wpt_fix_xy[0], wpt_fix_xy[1], 0.]), # trans
-                                       tf.transformations.quaternion_from_euler(0,0,0)) # quat
-                return
-            ## check if we have progressed
-            # find closest point to robot along the path
-            distances = np.linalg.norm(rob_fix_xy - gp_fix_xy, axis=-1)
-            closest_dist = np.min(distances)
-            # adds slack in case path has weird shape
-            closest_points_ids = np.where(np.abs(distances - closest_dist) < 0.5)[0]
-            closest_point_id = np.max(closest_points_ids) # pick most optimistic closest point
-            closest_dist = distances[closest_point_id]
-            # ass. path is evenly sampled, walk N points towards goal to find next potential waypoint
-            tentative_wpt_id = min(len(gp_fix_xy)-1, closest_point_id + self.WAYPOINT_DIST_STEPS)
-            tentative_wpt_dtg = gp_dtg[tentative_wpt_id]
-            #######
-            pub = rospy.Publisher("/tentative_wpt", Marker, queue_size=1)
-            mk = Marker()
-            mk.header.frame_id = self.kFixedFrame
-            mk.ns = "wpt"
-            mk.id = 0
-            mk.type = 1
-            mk.action = 0
-            wpt_fix_xy = gp_fix_xy[tentative_wpt_id]
-            mk.pose.position.x = wpt_fix_xy[0]
-            mk.pose.position.y = wpt_fix_xy[1]
-            mk.pose.position.z = -0.09
-            mk.scale.x = 0.1
-            mk.scale.y = 0.1 
-            mk.scale.z = 0.01
-            mk.color.b = 0
-            mk.color.g = 1
-            mk.color.r = 1
-            mk.color.a = 1
-            mk.frame_locked = True
-            pub.publish(mk)
-            #########3
-            # set as new waypoint
-            self.waypoint_dtg = tentative_wpt_dtg
-            wpt_fix_xy = gp_fix_xy[tentative_wpt_id]
-            self.tf_goal_in_fix = (np.array([wpt_fix_xy[0], wpt_fix_xy[1], 0.]), # trans
+            wpt_fix_xy = apply_tf(np.array(wpt_ref_xy), Pose2D(tf_ref_in_fix))
+            self.tf_wpt_in_fix = (np.array([wpt_fix_xy[0], wpt_fix_xy[1], 0.]), # trans
                                    tf.transformations.quaternion_from_euler(0,0,0)) # quat
+
 
 def parse_args():
     import argparse

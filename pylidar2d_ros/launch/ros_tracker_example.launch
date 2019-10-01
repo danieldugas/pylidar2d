@@ -2,6 +2,7 @@
 <launch>
   <arg name="rosbag" default="hg2" />
   <arg name="mapname" default="hg_main_hall" />
+  <arg name="mapfolder" default="$(env HOME)/maps"/>
 
   <!-- Rosbag -->
   <include file="$(find asl_pepper_rosbags)/launch/$(arg rosbag).launch">
@@ -15,7 +16,7 @@
     <arg name="output" value="log" />
     <arg name="slam_map_topic" value="/gmap"/>
     <arg name="reference_map_name" value="$(arg mapname)"/>
-    <arg name="maps_folder" value="$(env HOME)/maps"/>
+    <arg name="maps_folder" value="$(arg mapfolder)"/>
   </include>
 
   <!-- Tracker -->

@@ -2,6 +2,7 @@
 <launch>
   <arg name="rosbag" default="hg2" />
   <arg name="mapname" default="hg_main_hall" />
+  <arg name="mapfolder" default="$(env HOME)/maps"/>
 
   <!-- Rosbag -->
   <include file="$(find asl_pepper_rosbags)/launch/$(arg rosbag).launch">
@@ -15,15 +16,18 @@
     <arg name="output" value="log" />
     <arg name="slam_map_topic" value="/gmap"/>
     <arg name="reference_map_name" value="$(arg mapname)"/>
-    <arg name="maps_folder" value="$(env HOME)/maps"/>
+    <arg name="maps_folder" value="$(arg mapfolder)"/>
   </include>
 
   <!-- Global Path Planning -->
-  <node pkg="asl_pepper_motion_planning" type="motion_planner"
-    name="motion_planner" args="--map-name $(arg mapname) --map-folder $(arg mapfolder)" output="log" />
+  <node pkg="asl_pepper_motion_planning" type="global_planner"
+    name="global_planner" args="--hz" output="log" >
+    <param name="reference_map_name" value="$(arg mapname)"/>
+    <param name="reference_map_folder" value="$(arg mapfolder)"/>
+  </node>
 
   <!-- Tracker -->
-  <node pkg="ros_run_command" type="ros_run_command" name="python_tracker" output="screen"
+  <node pkg="ros_run_command" type="ros_run_command" name="python_tracker" output="log"
     args="python $(find pylidar2d_ros)/scripts/ros_tracker_example.py --hz --fixed-frame gmap">
     <param name="reference_map_name" value="$(arg mapname)"/>
   </node>

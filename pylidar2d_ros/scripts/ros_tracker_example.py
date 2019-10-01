@@ -70,6 +70,9 @@ class Clustering(object):
         self.kFixedFrame = args.fixed_frame # ideally something truly fixed, like /map
         self.kRobotFrame = "base_footprint"
         self.kMaxObstacleVel_ms = 10. # [m/s]
+        self.kEuclideanClusteringThresh = 0.05
+        self.kMinClusterSize = 3
+        self.kRobotRadius = rospy.get_param("/pepper_robot/radius", 0.3)
         # vars
         self.odom = None
         self.tf_rob_in_fix = None
@@ -120,7 +123,7 @@ class Clustering(object):
                 print("odom not received yet")
                 return
             if self.tf_rob_in_fix is None:
-                print("tf_rob_in_fix not found yet")
+                rospy.logwarn_throttle(10., "tf_rob_in_fix not found yet")
                 return
             # TODO check that odom and tf are not old
 
@@ -131,20 +134,18 @@ class Clustering(object):
             scan = np.array(msg.ranges, dtype=np.float32)
 
             # clustering
-            EUCLIDEAN_CLUSTERING_THRESH_M = 0.05
-            MIN_CLUSTER_SIZE = 3
             angles = np.linspace(0, 2*np.pi, scan.shape[0]+1, dtype=np.float32)[:-1]
             xx = np.cos(angles) * scan
             yy = np.sin(angles) * scan
             tic = timer()
             clusters, _, _ = lidar_clustering.euclidean_clustering(scan, angles,
-                                                             EUCLIDEAN_CLUSTERING_THRESH_M)
+                                                             self.kEuclideanClusteringThresh)
             cluster_sizes = lidar_clustering.cluster_sizes(len(scan), clusters)
             toc = timer()
             clustering_time = toc-tic
 
             # filter small clusters
-    #         clusters = [c for c, l in zip(clusters, cluster_sizes) if l >= MIN_CLUSTER_SIZE]
+    #         clusters = [c for c, l in zip(clusters, cluster_sizes) if l >= self.kMinClusterSize]
 
             # center of gravity
             tic = timer()
@@ -161,7 +162,7 @@ class Clustering(object):
             # legs
             is_legs = []
             for r, c, cog_in_fix in zip(radii, clusters, cogs_in_fix):
-                is_leg = True if 0.03 < r and r < 0.15 and len(c) >= MIN_CLUSTER_SIZE else False
+                is_leg = True if 0.03 < r and r < 0.15 and len(c) >= self.kMinClusterSize else False
                 # if a reference map and localization are available, filter detections which are in map
                 if self.refmap_manager.tf_frame_in_refmap is not None:
                     cog_in_refmap = apply_tf(cog_in_fix, Pose2D(self.refmap_manager.tf_frame_in_refmap))
@@ -440,7 +441,11 @@ class Clustering(object):
         obstacles_msg = ObstacleArrayMsg() 
         obstacles_msg.header.stamp = timestamp
         obstacles_msg.header.frame_id = self.kFixedFrame
-        for cog_in_fix, cog_in_rob, r, is_leg in zip(cogs_in_fix, cogs, radii, is_legs):
+        for c, cog_in_fix, cog_in_rob, r, is_leg in zip(clusters, cogs_in_fix, cogs, radii, is_legs):
+            if np.linalg.norm(cog_in_rob) < self.kRobotRadius:
+                continue
+            if len(c) < self.kMinClusterSize:
+                continue
             # leg obstacles are already published in the tracked obstacles topic
             if is_leg:
                 continue
@@ -449,7 +454,7 @@ class Clustering(object):
                 continue
             # Add point obstacle
             obst = ObstacleMsg()
-            obst.id = trackid
+            obst.id = 0
             obst.polygon.points = [Point32()]
             obst.polygon.points[0].x = cog_in_fix[0]
             obst.polygon.points[0].y = cog_in_fix[1]
