@@ -32,11 +32,13 @@
   <node pkg="ros_run_command" type="ros_run_command" name="python_tracker" output="log"
     args="python $(find pylidar2d_ros)/scripts/ros_tracker_example.py --hz --fixed-frame gmap">
     <param name="reference_map_name" value="$(arg mapname)"/>
+    <param name="reference_map_folder" value="$(arg mapfolder)"/>
   </node>
   <!-- ros_run_command does not forward node namespace to script, so the script gets param from absolute namespace /python_planner/PARAM_NAME -->
   <node pkg="ros_run_command" type="ros_run_command" name="python_planner" output="screen"
     args="python $(find pylidar2d_ros)/scripts/ros_planner_example.py --hz --fixed-frame gmap">
     <param name="reference_map_name" value="$(arg mapname)"/>
+    <param name="reference_map_folder" value="$(arg mapfolder)"/>
   </node>
 
 </launch>
