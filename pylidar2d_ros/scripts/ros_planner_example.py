@@ -380,7 +380,7 @@ class Planning(object):
         # resulting command vel, and path
         best_u, best_v = pred_rob_vel_in_rob
         # check if goal is reached
-        if np.linalg.norm(pred_end_in_rob) < 0.5:
+        if np.linalg.norm(pred_end_in_rob) < 0.1:
             best_u, best_v = (0, 0)
 
 
