@@ -39,6 +39,8 @@
     <param name="reference_map_name" value="$(arg mapname)"/>
   </node>
 
+  <!-- Rviz -->
+  <node type="rviz" name="rviz" pkg="rviz" args="-d $(env HOME)/.rviz/ros_planner_example.rviz" />
 </launch>
 
 

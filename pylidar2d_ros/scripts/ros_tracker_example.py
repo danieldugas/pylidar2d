@@ -406,6 +406,32 @@ class Clustering(object):
                 tracks_velocities.append(track.estimate_velocity())
                 tracks_radii.append(track.avg_radius())
 
+        # publish trackedpersons
+        from spencer_tracking_msgs.msg import TrackedPersons, TrackedPerson
+        pub = rospy.Publisher("/tracked_persons", TrackedPersons, queue_size=1)
+        tp_msg = TrackedPersons()
+        tp_msg.header.frame_id = self.kFixedFrame
+        tp_msg.header.stamp = timestamp
+        for trackid, xy, in_frame, vel, radius in zip(track_ids, tracks_latest_pos, tracks_in_frame, tracks_velocities, tracks_radii):
+            if not in_frame:
+                continue
+            tp = TrackedPerson()
+            tp.track_id = trackid
+            tp.is_occluded = False
+            tp.is_matched = False
+            tp.detection_id = trackid
+            tp.pose.pose.position.x = xy[0]
+            tp.pose.pose.position.y = xy[1]
+            heading_angle = np.arctan2(vel[1], vel[0]) # guess heading from velocity
+            from geometry_msgs.msg import Quaternion
+            tp.pose.pose.orientation = Quaternion(
+                *tf.transformations.quaternion_from_euler(0, 0, heading_angle))
+            tp.twist.twist.linear.x = vel[0]
+            tp.twist.twist.linear.y = vel[1]
+            tp.twist.twist.angular.z = 0 # unknown
+            tp_msg.tracks.append(tp)
+        pub.publish(tp_msg)
+
         pub = rospy.Publisher('/obstacles', ObstacleArrayMsg, queue_size=1)
         obstacles_msg = ObstacleArrayMsg() 
         obstacles_msg.header.stamp =  timestamp
