@@ -5,6 +5,7 @@ from geometry_msgs.msg import Twist, Quaternion
 from geometry_msgs.msg import Point, Point32, Twist, PoseStamped
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from map2d_ros_tools import ReferenceMapAndLocalizationManager
 import numpy as np
 from nav_msgs.msg import Odometry, Path
 from pose2d import Pose2D, apply_tf, apply_tf_to_pose, inverse_pose2d
@@ -26,38 +27,6 @@ from lib_tracking.lidar_tracking import Tracker
 N_PAST_POS = 100
 
 
-class ReferenceMapAndLocalizationManager(object):
-    """ If a reference map is provided and a tf exists,
-    keeps track of the tf for given frame in the reference map frame """
-    def __init__(self, map_folder, map_filename, reference_map_frame, frame_to_track):
-        self.tf_frame_in_refmap = None
-        self.map_ = None
-        self.map_as_tsdf = None
-        # loads map based on ros params
-        folder = map_folder
-        filename =  map_filename
-        try:
-            self.map_ = CMap2D(folder, filename)
-        except IOError as e:
-            rospy.logwarn(rospy.get_namespace())
-            rospy.logwarn("Failed to load reference map. Make sure {}.yaml and {}.pgm"
-                   " are in the {} folder.".format(filename, filename, folder))
-            rospy.logwarn("Disabling. No global localization or reference map will be available.")
-            return
-        # get frame info
-        self.kRefMapFrame = reference_map_frame
-        self.kFrame = frame_to_track
-        # launch callbacks
-        self.tf_listener = tf.TransformListener()
-        rospy.Timer(rospy.Duration(0.01), self.tf_callback)
-        self.map_as_tsdf = self.map_.as_sdf()
-
-    def tf_callback(self, event=None):
-        try:
-             self.tf_frame_in_refmap = self.tf_listener.lookupTransform(self.kRefMapFrame, self.kFrame, rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            rospy.logwarn_throttle(10., e)
-            return
 
 class Clustering(object):
     def __init__(self, args):
@@ -90,7 +59,9 @@ class Clustering(object):
         mapname = rospy.get_param("/python_tracker/reference_map_name", "map")
         mapframe = rospy.get_param("/python_tracker/reference_map_frame", "reference_map")
         mapfolder = rospy.get_param("/python_tracker/reference_map_folder", "~/maps")
-        self.refmap_manager = ReferenceMapAndLocalizationManager(mapfolder, mapname, mapframe, self.kFixedFrame)
+        def refmap_update_callback(self_):
+            self_.map_as_tsdf = self_.map_.as_sdf()
+        self.refmap_manager = ReferenceMapAndLocalizationManager(mapfolder, mapname, mapframe, self.kFixedFrame, refmap_update_callback=refmap_update_callback)
         # Timers
         rospy.Timer(rospy.Duration(0.001), self.tf_callback)
         # data
