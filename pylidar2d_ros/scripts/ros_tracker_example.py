@@ -413,12 +413,12 @@ class Clustering(object):
         tp_msg.header.frame_id = self.kFixedFrame
         tp_msg.header.stamp = timestamp
         for trackid, xy, in_frame, vel, radius in zip(track_ids, tracks_latest_pos, tracks_in_frame, tracks_velocities, tracks_radii):
-            if not in_frame:
-                continue
+#             if not in_frame:
+#                 continue
             tp = TrackedPerson()
             tp.track_id = trackid
             tp.is_occluded = False
-            tp.is_matched = False
+            tp.is_matched = in_frame
             tp.detection_id = trackid
             tp.pose.pose.position.x = xy[0]
             tp.pose.pose.position.y = xy[1]
