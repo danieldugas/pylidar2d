@@ -464,6 +464,7 @@ class Clustering(object):
 
             yaw = 0
             q = tf.transformations.quaternion_from_euler(0,0,yaw)
+            from geometry_msgs.msg import Quaternion
             obst.orientation = Quaternion(*q)
 
             obst.velocities.twist.linear.x = 0
